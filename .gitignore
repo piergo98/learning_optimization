@@ -1,1 +1,18 @@
 .venv/
+
+# Python cache in all subdirectories
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+
+# Figures files in all subdirectories
+**/*.eps
+**/*.pdf
+**/*.png
+**/*.jpg
+**/*.jpeg
+**/*.gif
+**/*.tiff
+**/*.bmp
+**/*.svg
