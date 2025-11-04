@@ -231,6 +231,7 @@ class StochasticGradientDescent:
             # Compute loss if loss function provided
             if loss_func is not None:
                 loss = loss_func(params, data=data)
+                # append loss to history (fix typo)
                 self.history['loss'].append(loss)
                 
                 # Early stopping based on loss
@@ -274,6 +275,324 @@ class StochasticGradientDescent:
             'learning_rate': [],
             'gradient_norm': []
         }
+
+
+class RMSPropOptimizer:
+    """RMSProp optimizer implementation (numpy-based).
+
+    Parameters
+    ----------
+    learning_rate : float
+        Base learning rate.
+    rho : float
+        Decay rate for squared gradient moving average (default 0.9).
+    eps : float
+        Small epsilon to avoid division by zero.
+    momentum : float
+        Optional momentum term (classical), default 0.0.
+    weight_decay : float
+        L2 regularization coefficient.
+    learning_rate_schedule : str or callable, optional
+        Learning rate schedule (same options as SGD class).
+    """
+
+    def __init__(self, learning_rate: float = 0.001, rho: float = 0.9, eps: float = 1e-8,
+                 momentum: float = 0.0, weight_decay: float = 0.0,
+                 learning_rate_schedule: Optional[Union[str, Callable]] = 'constant',
+                 schedule_params: Optional[Dict] = None):
+        self.initial_lr = learning_rate
+        self.lr = learning_rate
+        self.rho = rho
+        self.eps = eps
+        self.momentum = momentum
+        self.weight_decay = weight_decay
+        self.learning_rate_schedule = learning_rate_schedule
+        self.schedule_params = schedule_params or {}
+
+        self.squared_avg = None
+        self.velocity = None
+        self.history = {'loss': [], 'learning_rate': [], 'gradient_norm': []}
+
+    def _update_learning_rate(self, epoch: int) -> None:
+        if callable(self.learning_rate_schedule):
+            self.lr = self.learning_rate_schedule(epoch, self.initial_lr)
+        elif self.learning_rate_schedule == 'constant':
+            self.lr = self.initial_lr
+        elif self.learning_rate_schedule == 'step':
+            step_size = self.schedule_params.get('step_size', 10)
+            gamma = self.schedule_params.get('gamma', 0.1)
+            self.lr = self.initial_lr * (gamma ** (epoch // step_size))
+        elif self.learning_rate_schedule == 'exponential':
+            decay_rate = self.schedule_params.get('decay_rate', 0.01)
+            self.lr = self.initial_lr * np.exp(-decay_rate * epoch)
+        elif self.learning_rate_schedule == 'inverse':
+            decay_rate = self.schedule_params.get('decay_rate', 0.01)
+            self.lr = self.initial_lr / (1 + decay_rate * epoch)
+        else:
+            warnings.warn(f"Unknown schedule '{self.learning_rate_schedule}', using constant.")
+            self.lr = self.initial_lr
+
+    def _init_state(self, params: np.ndarray):
+        if self.squared_avg is None:
+            self.squared_avg = np.zeros_like(params)
+        if self.velocity is None:
+            self.velocity = np.zeros_like(params)
+
+    def step(self, params: np.ndarray, gradient: np.ndarray) -> np.ndarray:
+        self._init_state(params)
+
+        if self.weight_decay > 0:
+            gradient = gradient + self.weight_decay * params
+
+        # update squared average
+        self.squared_avg = self.rho * self.squared_avg + (1 - self.rho) * (gradient ** 2)
+
+        # compute update
+        adjusted_grad = gradient / (np.sqrt(self.squared_avg) + self.eps)
+
+        if self.momentum > 0:
+            self.velocity = self.momentum * self.velocity + self.lr * adjusted_grad
+            params = params - self.velocity
+        else:
+            params = params - self.lr * adjusted_grad
+
+        return params
+
+    def optimize(self, *args, **kwargs):
+        # Reuse existing SGD-like optimize loop for convenience by delegating
+        # to a small wrapper that calls step. Implemented here to match API.
+        params_init = args[0]
+        gradient_func = args[1]
+        # Extract common kwargs
+        n_epochs = kwargs.get('n_epochs', 100)
+        batch_size = kwargs.get('batch_size', None)
+        data = kwargs.get('data', None)
+        n_samples = kwargs.get('n_samples', None)
+        loss_func = kwargs.get('loss_func', None)
+        verbose = kwargs.get('verbose', True)
+        tol = kwargs.get('tol', 1e-6)
+        patience = kwargs.get('patience', None)
+
+        params = params_init.copy()
+        best_loss = float('inf')
+        patience_counter = 0
+
+        self.history = {'loss': [], 'learning_rate': [], 'gradient_norm': []}
+
+        for epoch in range(n_epochs):
+            self._update_learning_rate(epoch)
+
+            if batch_size is not None and n_samples is not None:
+                indices = np.random.permutation(n_samples)
+                n_batches = int(np.ceil(n_samples / batch_size))
+            else:
+                indices = None
+                n_batches = 1
+
+            epoch_gradients = []
+
+            for batch_idx in range(n_batches):
+                if indices is not None:
+                    start_idx = batch_idx * batch_size
+                    end_idx = min((batch_idx + 1) * batch_size, n_samples)
+                    batch_indices = indices[start_idx:end_idx]
+                else:
+                    batch_indices = None
+
+                gradient = gradient_func(params, indices=batch_indices, data=data)
+                epoch_gradients.append(gradient)
+                params = self.step(params, gradient)
+
+            avg_gradient = np.mean(epoch_gradients, axis=0)
+            gradient_norm = np.linalg.norm(avg_gradient)
+
+            if loss_func is not None:
+                loss = loss_func(params, data=data)
+                self.history['loss'].append(loss)
+                if patience is not None:
+                    if loss < best_loss - tol:
+                        best_loss = loss
+                        patience_counter = 0
+                    else:
+                        patience_counter += 1
+                        if patience_counter >= patience:
+                            if verbose:
+                                print(f"Early stopping at epoch {epoch+1}")
+                            break
+            else:
+                loss = None
+
+            self.history['learning_rate'].append(self.lr)
+            self.history['gradient_norm'].append(gradient_norm)
+
+            if verbose and (epoch % max(1, n_epochs // 10) == 0 or epoch == n_epochs - 1):
+                msg = f"Epoch {epoch+1}/{n_epochs} - LR: {self.lr:.6f} - Grad norm: {gradient_norm:.6e}"
+                if loss is not None:
+                    msg += f" - Loss: {loss:.6e}"
+                print(msg)
+
+            if gradient_norm < tol:
+                if verbose:
+                    print(f"Converged at epoch {epoch+1} (gradient norm < {tol})")
+                break
+
+        return params, self.history
+
+
+class AdamOptimizer:
+    """Adam optimizer implementation (numpy-based).
+
+    Parameters
+    ----------
+    learning_rate : float
+        Base step size.
+    beta1 : float
+        Exponential decay rate for first moment estimates.
+    beta2 : float
+        Exponential decay rate for second moment estimates.
+    eps : float
+        Small epsilon to prevent division by zero.
+    weight_decay : float
+        L2 regularization coefficient.
+    """
+
+    def __init__(self, learning_rate: float = 0.001, beta1: float = 0.9, beta2: float = 0.999,
+                 eps: float = 1e-8, weight_decay: float = 0.0,
+                 learning_rate_schedule: Optional[Union[str, Callable]] = 'constant',
+                 schedule_params: Optional[Dict] = None):
+        self.initial_lr = learning_rate
+        self.lr = learning_rate
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.eps = eps
+        self.weight_decay = weight_decay
+        self.learning_rate_schedule = learning_rate_schedule
+        self.schedule_params = schedule_params or {}
+
+        self.m = None
+        self.v = None
+        self.t = 0
+        self.history = {'loss': [], 'learning_rate': [], 'gradient_norm': []}
+
+    def _update_learning_rate(self, epoch: int) -> None:
+        if callable(self.learning_rate_schedule):
+            self.lr = self.learning_rate_schedule(epoch, self.initial_lr)
+        elif self.learning_rate_schedule == 'constant':
+            self.lr = self.initial_lr
+        elif self.learning_rate_schedule == 'step':
+            step_size = self.schedule_params.get('step_size', 10)
+            gamma = self.schedule_params.get('gamma', 0.1)
+            self.lr = self.initial_lr * (gamma ** (epoch // step_size))
+        elif self.learning_rate_schedule == 'exponential':
+            decay_rate = self.schedule_params.get('decay_rate', 0.01)
+            self.lr = self.initial_lr * np.exp(-decay_rate * epoch)
+        elif self.learning_rate_schedule == 'inverse':
+            decay_rate = self.schedule_params.get('decay_rate', 0.01)
+            self.lr = self.initial_lr / (1 + decay_rate * epoch)
+        else:
+            warnings.warn(f"Unknown schedule '{self.learning_rate_schedule}', using constant.")
+            self.lr = self.initial_lr
+
+    def _init_state(self, params: np.ndarray):
+        if self.m is None:
+            self.m = np.zeros_like(params)
+        if self.v is None:
+            self.v = np.zeros_like(params)
+
+    def step(self, params: np.ndarray, gradient: np.ndarray) -> np.ndarray:
+        self._init_state(params)
+        self.t += 1
+
+        if self.weight_decay > 0:
+            gradient = gradient + self.weight_decay * params
+
+        self.m = self.beta1 * self.m + (1 - self.beta1) * gradient
+        self.v = self.beta2 * self.v + (1 - self.beta2) * (gradient ** 2)
+
+        m_hat = self.m / (1 - self.beta1 ** self.t)
+        v_hat = self.v / (1 - self.beta2 ** self.t)
+
+        params = params - self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
+
+        return params
+
+    def optimize(self, *args, **kwargs):
+        # Same loop pattern as RMSProp.optimize
+        params_init = args[0]
+        gradient_func = args[1]
+        n_epochs = kwargs.get('n_epochs', 100)
+        batch_size = kwargs.get('batch_size', None)
+        data = kwargs.get('data', None)
+        n_samples = kwargs.get('n_samples', None)
+        loss_func = kwargs.get('loss_func', None)
+        verbose = kwargs.get('verbose', True)
+        tol = kwargs.get('tol', 1e-6)
+        patience = kwargs.get('patience', None)
+
+        params = params_init.copy()
+        best_loss = float('inf')
+        patience_counter = 0
+
+        self.history = {'loss': [], 'learning_rate': [], 'gradient_norm': []}
+
+        for epoch in range(n_epochs):
+            self._update_learning_rate(epoch)
+
+            if batch_size is not None and n_samples is not None:
+                indices = np.random.permutation(n_samples)
+                n_batches = int(np.ceil(n_samples / batch_size))
+            else:
+                indices = None
+                n_batches = 1
+
+            epoch_gradients = []
+
+            for batch_idx in range(n_batches):
+                if indices is not None:
+                    start_idx = batch_idx * batch_size
+                    end_idx = min((batch_idx + 1) * batch_size, n_samples)
+                    batch_indices = indices[start_idx:end_idx]
+                else:
+                    batch_indices = None
+
+                gradient = gradient_func(params, indices=batch_indices, data=data)
+                epoch_gradients.append(gradient)
+                params = self.step(params, gradient)
+
+            avg_gradient = np.mean(epoch_gradients, axis=0)
+            gradient_norm = np.linalg.norm(avg_gradient)
+
+            if loss_func is not None:
+                loss = loss_func(params, data=data)
+                self.history['loss'].append(loss)
+                if patience is not None:
+                    if loss < best_loss - tol:
+                        best_loss = loss
+                        patience_counter = 0
+                    else:
+                        patience_counter += 1
+                        if patience_counter >= patience:
+                            if verbose:
+                                print(f"Early stopping at epoch {epoch+1}")
+                            break
+            else:
+                loss = None
+
+            self.history['learning_rate'].append(self.lr)
+            self.history['gradient_norm'].append(gradient_norm)
+
+            if verbose and (epoch % max(1, n_epochs // 10) == 0 or epoch == n_epochs - 1):
+                msg = f"Epoch {epoch+1}/{n_epochs} - LR: {self.lr:.6f} - Grad norm: {gradient_norm:.6e}"
+                if loss is not None:
+                    msg += f" - Loss: {loss:.6e}"
+                print(msg)
+
+            if gradient_norm < tol:
+                if verbose:
+                    print(f"Converged at epoch {epoch+1} (gradient norm < {tol})")
+                break
+
+        return params, self.history
 
 
 def sgd_optimize(
@@ -327,4 +646,92 @@ def sgd_optimize(
         verbose=verbose,
         tol=tol,
         patience=patience
+    )
+
+
+def rmsprop_optimize(
+    params_init: np.ndarray,
+    gradient_func: Callable,
+    loss_func: Optional[Callable] = None,
+    learning_rate: float = 0.001,
+    rho: float = 0.9,
+    eps: float = 1e-8,
+    momentum: float = 0.0,
+    weight_decay: float = 0.0,
+    learning_rate_schedule: Optional[Union[str, Callable]] = 'constant',
+    schedule_params: Optional[Dict] = None,
+    n_epochs: int = 100,
+    batch_size: Optional[int] = None,
+    data: Optional[Tuple] = None,
+    n_samples: Optional[int] = None,
+    verbose: bool = True,
+    tol: float = 1e-6,
+    patience: Optional[int] = None,
+) -> Tuple[np.ndarray, Dict]:
+    """Convenience wrapper for RMSProp optimization."""
+    optimizer = RMSPropOptimizer(
+        learning_rate=learning_rate,
+        rho=rho,
+        eps=eps,
+        momentum=momentum,
+        weight_decay=weight_decay,
+        learning_rate_schedule=learning_rate_schedule,
+        schedule_params=schedule_params,
+    )
+
+    return optimizer.optimize(
+        params_init,
+        gradient_func,
+        n_epochs=n_epochs,
+        batch_size=batch_size,
+        data=data,
+        n_samples=n_samples,
+        loss_func=loss_func,
+        verbose=verbose,
+        tol=tol,
+        patience=patience,
+    )
+
+
+def adam_optimize(
+    params_init: np.ndarray,
+    gradient_func: Callable,
+    loss_func: Optional[Callable] = None,
+    learning_rate: float = 0.001,
+    beta1: float = 0.9,
+    beta2: float = 0.999,
+    eps: float = 1e-8,
+    weight_decay: float = 0.0,
+    learning_rate_schedule: Optional[Union[str, Callable]] = 'constant',
+    schedule_params: Optional[Dict] = None,
+    n_epochs: int = 100,
+    batch_size: Optional[int] = None,
+    data: Optional[Tuple] = None,
+    n_samples: Optional[int] = None,
+    verbose: bool = True,
+    tol: float = 1e-6,
+    patience: Optional[int] = None,
+) -> Tuple[np.ndarray, Dict]:
+    """Convenience wrapper for Adam optimization."""
+    optimizer = AdamOptimizer(
+        learning_rate=learning_rate,
+        beta1=beta1,
+        beta2=beta2,
+        eps=eps,
+        weight_decay=weight_decay,
+        learning_rate_schedule=learning_rate_schedule,
+        schedule_params=schedule_params,
+    )
+
+    return optimizer.optimize(
+        params_init,
+        gradient_func,
+        n_epochs=n_epochs,
+        batch_size=batch_size,
+        data=data,
+        n_samples=n_samples,
+        loss_func=loss_func,
+        verbose=verbose,
+        tol=tol,
+        patience=patience,
     )
