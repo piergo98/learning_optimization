@@ -11,7 +11,7 @@ This example shows how to:
 import numpy as np
 import torch
 import time
-from sgd import torch_optimize, TorchAdam, TorchSGD
+from optimizers import gpu_optimize, Adam, SGD
 
 # Check if CUDA is available
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -58,11 +58,11 @@ def example_1_simple_quadratic():
     # CPU optimization
     print("\n--- Running on CPU ---")
     start_time = time.time()
-    x_cpu, hist_cpu = torch_optimize(
+    x_cpu, hist_cpu = gpu_optimize(
         x_init,
         gradient_func_torch,
         loss_func=loss_func_torch,
-        optimizer='adam',
+        optimizer='sgd',
         learning_rate=0.1,
         n_epochs=100,
         data=(A, x_opt),
@@ -78,7 +78,7 @@ def example_1_simple_quadratic():
     if device == 'cuda':
         print("\n--- Running on GPU ---")
         start_time = time.time()
-        x_gpu, hist_gpu = torch_optimize(
+        x_gpu, hist_gpu = gpu_optimize(
             x_init,
             gradient_func_torch,
             loss_func=loss_func_torch,
@@ -150,7 +150,7 @@ def example_2_casadi_wrapper():
     x_init = torch.randn(n_dim) * 5.0  # Start far from optimum
     
     print("\nOptimizing with Adam (using CasADi gradients)...")
-    x_opt, history = torch_optimize(
+    x_opt, history = gpu_optimize(
         x_init,
         torch_gradient_wrapper,
         loss_func=torch_loss_wrapper,
@@ -199,7 +199,7 @@ def example_3_optimizer_comparison():
         print(f"\n--- {opt_name} ---")
         start_time = time.time()
         
-        x_final, hist = torch_optimize(
+        x_final, hist = gpu_optimize(
             x_init.clone(),
             gradient_func,
             loss_func=loss_func,
@@ -263,7 +263,7 @@ def example_4_large_scale():
     
     print("\nRunning Adam on GPU...")
     start_time = time.time()
-    x_final, history = torch_optimize(
+    x_final, history = gpu_optimize(
         x_init,
         gradient_func,
         loss_func=loss_func,

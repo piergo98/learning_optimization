@@ -10,6 +10,28 @@ from typing import Callable, Optional, Union, Tuple, Dict, List
 import warnings
 
 
+def _check_finite_array(x: np.ndarray, context: str = '') -> None:
+    """Raise a clear error if array contains NaN or Inf.
+
+    Includes a small diagnostics message (min/max/norm) to help debugging.
+    """
+    if not np.all(np.isfinite(x)):
+        # compute some diagnostics where possible
+        try:
+            finite_mask = np.isfinite(x)
+            any_finite = np.any(finite_mask)
+            x_min = np.min(x[finite_mask]) if any_finite else float('nan')
+            x_max = np.max(x[finite_mask]) if any_finite else float('nan')
+            x_norm = np.linalg.norm(x[finite_mask]) if any_finite else float('nan')
+        except Exception:
+            x_min = x_max = x_norm = float('nan')
+        raise ValueError(
+            f"Non-finite values detected in {context}. "
+            f"Stats over finite elements: min={x_min}, max={x_max}, norm={x_norm}. "
+            f"Full array sample: {x.flatten()[:10]}"
+        )
+
+
 class StochasticGradientDescent:
     """
     Stochastic Gradient Descent optimizer.
@@ -219,6 +241,12 @@ class StochasticGradientDescent:
                 
                 # Compute gradient for this batch
                 gradient = gradient_func(params, indices=batch_indices, data=data)
+                # Sanity check: gradient must be finite numeric array
+                try:
+                    _check_finite_array(np.asarray(gradient), context='gradient (batch)')
+                except ValueError:
+                    # Re-raise with context about epoch/batch
+                    raise
                 epoch_gradients.append(gradient)
                 
                 # Update parameters
@@ -231,8 +259,15 @@ class StochasticGradientDescent:
             # Compute loss if loss function provided
             if loss_func is not None:
                 loss = loss_func(params, data=data)
-                # append loss to history (fix typo)
-                self.history['loss'].append(loss)
+                # Sanity check: loss should be finite scalar
+                try:
+                    loss_val = float(loss)
+                except Exception:
+                    raise ValueError(f"Loss function returned non-scalar or non-convertible value: {loss}")
+                if not np.isfinite(loss_val):
+                    raise ValueError(f"Non-finite loss detected at epoch {epoch}: {loss_val}")
+                # append loss to history
+                self.history['loss'].append(loss_val)
                 
                 # Early stopping based on loss
                 if patience is not None:

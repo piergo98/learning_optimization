@@ -4,14 +4,56 @@ PyTorch-based optimizers for GPU-accelerated optimization.
 These optimizers work with torch.Tensor objects and can run on GPU for large-scale problems.
 All optimizers follow the same interface as the NumPy versions but operate on PyTorch tensors.
 """
-
+import numpy as np
 import torch
 import torch.nn as nn
 from typing import Callable, Optional, Union, Tuple, Dict
 import warnings
 
 
-class TorchSGD:
+def _check_finite_tensor(x: torch.Tensor, context: str = '') -> None:
+    """Raise if tensor contains NaN or Inf; include detailed diagnostics.
+
+    The message includes: shape, dtype, device, number of finite/non-finite elements,
+    min/max/norm over finite elements, indices of the first non-finite elements
+    (up to 10), and a small value sample for quick inspection.
+    """
+    if not torch.all(torch.isfinite(x)):
+        # attempt to compute diagnostics on CPU
+        x_cpu = x.detach().cpu()
+        finite_mask = torch.isfinite(x_cpu)
+        num_total = x_cpu.numel()
+        num_finite = int(finite_mask.sum().item())
+        num_nonfinite = num_total - num_finite
+
+        any_finite = num_finite > 0
+        try:
+            x_min = float(torch.min(x_cpu[finite_mask]).item()) if any_finite else float('nan')
+            x_max = float(torch.max(x_cpu[finite_mask]).item()) if any_finite else float('nan')
+            x_norm = float(torch.norm(x_cpu[finite_mask]).item()) if any_finite else float('nan')
+        except Exception:
+            x_min = x_max = x_norm = float('nan')
+
+        # indices of first few non-finite elements
+        try:
+            nonfinite_idx = (~finite_mask).nonzero(as_tuple=False).flatten()[:10].cpu().numpy().tolist()
+        except Exception:
+            nonfinite_idx = []
+
+        # sample some elements (first 10)
+        sample = x_cpu.flatten()[:10].cpu().numpy().tolist()
+
+        raise ValueError(
+            f"Non-finite values detected in {context}. "
+            f"shape={tuple(x.shape)}, dtype={x.dtype}, device={x.device}. "
+            f"Finite/Total={num_finite}/{num_total} (non-finite={num_nonfinite}). "
+            f"Stats over finite elements: min={x_min}, max={x_max}, norm={x_norm}. "
+            f"First non-finite indices (up to 10): {nonfinite_idx}. "
+            f"Sample( first 10 values ): {sample}"
+        )
+
+
+class SGD:
     """
     PyTorch-based SGD optimizer with GPU support.
     
@@ -97,7 +139,7 @@ class TorchSGD:
     
     def optimize(
         self,
-        params_init: Union[torch.Tensor, 'np.ndarray'],
+        params_init: Union[torch.Tensor, np.ndarray],
         gradient_func: Callable,
         loss_func: Optional[Callable] = None,
         n_epochs: int = 100,
@@ -185,6 +227,28 @@ class TorchSGD:
                     gradient = torch.tensor(gradient, dtype=torch.float32, device=self.device)
                 else:
                     gradient = gradient.to(self.device)
+
+                # Sanity check: gradient must be finite. If not, include parameter stats to help debug.
+                try:
+                    _check_finite_tensor(gradient, context=f'gradient (epoch={epoch}, batch={batch_idx})')
+                except ValueError as e:
+                    # capture a few useful parameter statistics for debugging
+                    try:
+                        params_cpu = params.detach().cpu().numpy()
+                        p_min = float(np.min(params_cpu))
+                        p_max = float(np.max(params_cpu))
+                        p_mean = float(np.mean(params_cpu))
+                        p_norm = float(np.linalg.norm(params_cpu))
+                        params_sample = params_cpu.flatten()[:10].tolist()
+                        raise ValueError(
+                            str(e) +
+                            f"\nParameter stats at failure: shape={params_cpu.shape}, "
+                            f"min={p_min}, max={p_max}, mean={p_mean}, norm={p_norm}. "
+                            f"Param sample (first 10): {params_sample}"
+                        )
+                    except Exception:
+                        # If params can't be inspected, re-raise original
+                        raise
                 
                 epoch_gradients.append(gradient)
                 
@@ -200,6 +264,9 @@ class TorchSGD:
                 loss = loss_func(params, data=data)
                 if isinstance(loss, torch.Tensor):
                     loss = loss.item()
+                # Sanity check: loss should be finite
+                if not np.isfinite(loss):
+                    raise ValueError(f"Non-finite loss detected at epoch {epoch}: {loss}")
                 self.history['loss'].append(loss)
                 
                 # Early stopping based on loss
@@ -235,7 +302,7 @@ class TorchSGD:
         return params, self.history
 
 
-class TorchAdam:
+class Adam:
     """
     PyTorch-based Adam optimizer with GPU support.
     
@@ -357,7 +424,27 @@ class TorchAdam:
                     gradient = torch.tensor(gradient, dtype=torch.float32, device=self.device)
                 else:
                     gradient = gradient.to(self.device)
-                
+
+                # Sanity check: gradient must be finite. If not, include parameter stats to help debug.
+                try:
+                    _check_finite_tensor(gradient, context=f'gradient (epoch={epoch}, batch={batch_idx})')
+                except ValueError as e:
+                    try:
+                        params_cpu = params.detach().cpu().numpy()
+                        p_min = float(np.min(params_cpu))
+                        p_max = float(np.max(params_cpu))
+                        p_mean = float(np.mean(params_cpu))
+                        p_norm = float(np.linalg.norm(params_cpu))
+                        params_sample = params_cpu.flatten()[:10].tolist()
+                        raise ValueError(
+                            str(e) +
+                            f"\nParameter stats at failure: shape={params_cpu.shape}, "
+                            f"min={p_min}, max={p_max}, mean={p_mean}, norm={p_norm}. "
+                            f"Param sample (first 10): {params_sample}"
+                        )
+                    except Exception:
+                        raise
+
                 epoch_gradients.append(gradient)
                 params = self.step(params, gradient)
             
@@ -368,6 +455,9 @@ class TorchAdam:
                 loss = loss_func(params, data=data)
                 if isinstance(loss, torch.Tensor):
                     loss = loss.item()
+                # Sanity check: loss should be finite
+                if not np.isfinite(loss):
+                    raise ValueError(f"Non-finite loss detected at epoch {epoch}: {loss}")
                 self.history['loss'].append(loss)
                 
                 if patience is not None:
@@ -400,7 +490,7 @@ class TorchAdam:
         return params, self.history
 
 
-class TorchRMSProp:
+class RMSProp:
     """
     PyTorch-based RMSProp optimizer with GPU support.
     
@@ -563,7 +653,7 @@ class TorchRMSProp:
         return params, self.history
 
 
-def torch_optimize(
+def gpu_optimize(
     params_init,
     gradient_func: Callable,
     loss_func: Optional[Callable] = None,
@@ -623,19 +713,19 @@ def torch_optimize(
     opt_name = optimizer.lower()
     
     if opt_name == 'sgd':
-        opt = TorchSGD(
+        opt = SGD(
             learning_rate=learning_rate,
             device=device,
             **optimizer_kwargs
         )
     elif opt_name == 'adam':
-        opt = TorchAdam(
+        opt = Adam(
             learning_rate=learning_rate,
             device=device,
             **optimizer_kwargs
         )
     elif opt_name == 'rmsprop':
-        opt = TorchRMSProp(
+        opt = RMSProp(
             learning_rate=learning_rate,
             device=device,
             **optimizer_kwargs

@@ -3,12 +3,16 @@ import matplotlib.pyplot as plt
 import numpy as np
 import os
 import scipy.io
+import torch
 
 from scipy.linalg import solve_continuous_are
 
-from ocslc.switched_linear_mpc import SwitchedLinearMPC
-from sgd import StochasticGradientDescent, RMSPropOptimizer, AdamOptimizer
-from sgd import sgd_optimize, rmsprop_optimize, adam_optimize
+from ocslc.switched_linear_mpc import SwiLin
+from optimizers import SGD, Adam, RMSProp
+from optimizers import gpu_optimize
+
+# Check if CUDA is available
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 def switched_problem(n_phases=5):
     """
@@ -28,54 +32,45 @@ def switched_problem(n_phases=5):
     
     xr = np.array([1, -3])
     
-    swi_lin_mpc = SwitchedLinearMPC(
-        model, 
+    swi_lin = SwiLin(
         n_phases, 
+        n_states,
+        n_inputs,
         time_horizon, 
         auto=False, 
-        multiple_shooting=False, 
-        x0=x0
     )
+    
+    # Load model
+    swi_lin.load_model(model)
 
     Q = 1. * np.eye(n_states)
     R = 0.1 * np.eye(n_inputs)
     # Solve the Algebraic Riccati Equation
     P = np.array(solve_continuous_are(model['A'][0], model['B'][0], Q, R))
 
-    swi_lin_mpc.precompute_matrices(x0, Q, R, P)
-    swi_lin_mpc.set_cost_function_single_shooting(R, x0)
-    J = swi_lin_mpc.cost
-    J_func = ca.Function('J_func', [*ca.symvar(J)], [J])
+    swi_lin.precompute_matrices(x0, Q, R, P)
+    x0 = np.append(x0, 1)  # augment with 1 for affine term
+    J_func = swi_lin.cost_function(R, x0)
         
     grad_J_u = []
     grad_J_delta = []
 
     for k in range(n_phases):
         # Compute gradient of the cost
-        du, d_delta = swi_lin_mpc.grad_cost_function(k, R)
-        # print(f"Phase {k}: du = {du}, d_delta = {d_delta}")
+        du, d_delta = swi_lin.grad_cost_function(k, R)
+        # print(f"Length du: {len(du)}")
 
-        grad_J_u.append(du)
+        grad_J_u.append(*du)
         grad_J_delta.append(d_delta)
 
-    # Stack the gradients for optimization
-    # Build interleaved gradient: U_0 Delta_0 U_1 Delta_1 ...
-    interleaved = []
-    for k in range(n_phases):
-        u_k = np.ravel(grad_J_u[k])
-        delta_k = np.atleast_1d(grad_J_delta[k]).ravel()
-        interleaved.append(u_k)
-        interleaved.append(delta_k)
-
-    grad_J = np.hstack(interleaved)
-    # print(f"Gradient shape: {grad_J.shape}")
+    grad_J = ca.vertcat(*grad_J_delta, *grad_J_u)
 
     # keep the original stacked forms if needed
     grad_J_u = np.hstack(grad_J_u)
     grad_J_delta = np.hstack(grad_J_delta)
-
+    
     # Create a CasADi function for the gradient
-    grad_J_func = ca.Function('grad_J', [*ca.symvar(grad_J)], [grad_J])
+    grad_J_func = ca.Function('grad_J', [*swi_lin.u, *swi_lin.delta], [grad_J])
     
     # Create wrapper functions for the optimizer
     def cost_function(params, indices=None, data=None):
@@ -84,9 +79,11 @@ def switched_problem(n_phases=5):
         indices: optional indices to select a minibatch from a 2D params array
         Returns the scalar loss (averaged over minibatch if batch provided).
         """
-        params = np.asarray(params)
+        # Wrapper that convert torch -> numpy -> CasADi -> numpy -> torch
+        params_np = params.detach().cpu().numpy()
         # Compute the cost function for a single example (no batch)
-        J = float(J_func(*params).full().item())
+        J_np = float(J_func(*params_np).full().item())
+        # J_np = 0
         
         if data is not None:
             u = data['controls']
@@ -97,7 +94,10 @@ def switched_problem(n_phases=5):
             # Compute the loss wrt reference params
             params_ref = np.asarray(params_ref)
             # add numpy sum of squared differences to scalar loss
-            J += float(np.sum((params - params_ref) ** 2))
+            J_np += float(np.sum((params_np - params_ref) ** 2))
+            
+        # Convert back to torch tensor on same device as input
+        J = torch.tensor(J_np, dtype=torch.float32, device=params.device)
 
         return J
 
@@ -107,9 +107,10 @@ def switched_problem(n_phases=5):
         indices: optional indices to select a minibatch from a 2D params array
         Returns gradient vector (n_params,) averaged over minibatch if batch provided.
         """
-        params = np.asarray(params)
+        # Wrapper that convert torch -> numpy -> CasADi -> numpy -> torch
+        params_np = params.detach().cpu().numpy()
         # single example
-        grad_J = np.asarray(grad_J_func(*params).full().ravel())
+        grad_J_np = np.asarray(grad_J_func(*params_np).full().ravel())
         
         if data is not None:
             u = data['controls']
@@ -117,11 +118,12 @@ def switched_problem(n_phases=5):
             params_ref = np.concatenate([u.ravel(), phases_duration.ravel()])
             params_ref = np.asarray(params_ref)
             # add gradient of the squared differences to grad_J
-            grad_J += 2 * (params - params_ref)
+            grad_J_np += 2 * (params_np - params_ref)
+            
+        # Convert back to torch tensor on same device as input
+        grad_J = torch.tensor(grad_J_np, dtype=torch.float32, device=params.device)
             
         return grad_J
-
-        
 
     return J_func, grad_J_func, cost_function, gradient_function
 
@@ -137,11 +139,19 @@ def params_optimization(optimizer="sgd", data=None):
     if data is not None:
         u = data['controls']
         phases_duration = data['phases_duration']
-        initial_params = np.concatenate([u.ravel(), phases_duration.ravel()])
+        true_params = np.concatenate([u.ravel(), phases_duration.ravel()])
         # Add some noise to the initial parameters
-        initial_params += np.random.normal(0, 0.1, initial_params.shape)
+        initial_params = np.random.normal(true_params, 0.1, true_params.shape)
     else:
         initial_params = np.zeros(n_phases * (1 + 1))  # 1 inputs + 1 duration per phase
+        
+    # Evaluate initial cost and gradient
+    initial_cost = cost_function(torch.tensor(initial_params, dtype=torch.float32, device=device), data=data).item()
+    initial_grad = gradient_function(torch.tensor(initial_params, dtype=torch.float32, device=device), data=data).cpu().numpy()
+    # print("Initial parameters:", initial_params)
+    # print(f"Initial cost: {initial_cost}")
+    # print(f"Initial gradient norm: {np.linalg.norm(initial_grad)}")
+    # input("Press Enter to start optimization...")
 
     # Choose learning rate schedule
     schedules = [
@@ -152,48 +162,33 @@ def params_optimization(optimizer="sgd", data=None):
     ]
     schedule = schedules[0]['schedule']
     params = schedules[0].get('params', {})
-
-    if optimizer == "sgd":
-        params_optimized, history = sgd_optimize(
-                params_init=initial_params,
-                gradient_func=gradient_function,
-                loss_func=cost_function,  # optional
-                learning_rate=0.0001,
-                n_epochs=1000,
-                learning_rate_schedule=schedule,
-                schedule_params=params,
-                data=data,
-        )
-    elif optimizer == "rmsprop":
-        params_optimized, history = rmsprop_optimize(
-                params_init=initial_params,
-                gradient_func=gradient_function,
-                loss_func=cost_function,  # optional
-                learning_rate=0.001,
-                n_epochs=1000,
-                learning_rate_schedule=schedule,
-                schedule_params=params,
-                weight_decay=0.9,
-                eps=1e-8,
-                data=data,
-        )
-    elif optimizer == "adam":
-        params_optimized, history = adam_optimize(
-                params_init=initial_params,
-                gradient_func=gradient_function,
-                loss_func=cost_function,  # optional
-                learning_rate=0.01,
-                n_epochs=1000,
-                learning_rate_schedule=schedule,
-                schedule_params=params,
-                beta1=0.9,
-                beta2=0.999,
-                eps=1e-8,
-                data=data,
-        )
-    else:
-        raise ValueError(f"Unknown optimizer: {optimizer}")
     
+    optimizers = [
+        ('SGD', {'momentum': 0.9, 'nesterov': True}),
+        ('Adam', {'beta1': 0.9, 'beta2': 0.999}),
+        ('RMSProp', {'rho': 0.9}),
+    ]
+    
+    # Gather optimizer-specific parameters based on the chosen optimizer
+    optimizer_params = optimizers[0][1] if optimizer == "sgd" else optimizers[1][1] if optimizer == "adam" else optimizers[2][1]
+
+    params_optimized, history = gpu_optimize(
+            params_init=initial_params,
+            gradient_func=gradient_function,
+            optimizer=optimizer,
+            loss_func=cost_function,  # optional
+            learning_rate=1e-4,
+            n_epochs=1000,
+            data=data,
+            device=device,
+            verbose=True,
+            **optimizer_params,
+    )
+    
+    # Convert optimized params to numpy for plotting/printing
+    if torch.is_tensor(params_optimized):
+        params_optimized = params_optimized.detach().cpu().numpy()
+
     # Print results
     print("Optimized Parameters:", params_optimized)
     plot_params(params_optimized, n_phases)
@@ -233,8 +228,8 @@ def plot_params(params_optimized, n_phases):
     """
     Plot the optimized parameters (inputs and durations) over phases.
     """
-    inputs = params_optimized[0::2]
-    durations = params_optimized[1::2]
+    inputs = params_optimized[:n_phases]
+    durations = params_optimized[n_phases:]
 
     fig, axes = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
 
@@ -282,6 +277,6 @@ if __name__ == "__main__":
     data_file = "optimal_params.mat"
     data = load_data(data_file)
     
-    optimizer = "rmsprop"
+    optimizer = "adam"
     params_optimization(optimizer, data)
 
