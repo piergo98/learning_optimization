@@ -7,7 +7,7 @@ gradient expressions.
 
 import numpy as np
 import matplotlib.pyplot as plt
-from sgd import StochasticGradientDescent, sgd_optimize
+from optimizers import StochasticGradientDescent, sgd_optimize
 
 
 def example_quadratic():

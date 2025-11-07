@@ -31,7 +31,7 @@ pip install numpy matplotlib
 ### Basic Usage
 
 ```python
-from sgd import sgd_optimize
+from optimizers import sgd_optimize
 import numpy as np
 
 # Define your gradient function
@@ -65,7 +65,7 @@ params_optimized, history = sgd_optimize(
 ### Using the Class Interface
 
 ```python
-from sgd import StochasticGradientDescent
+from optimizers import StochasticGradientDescent
 
 # Create optimizer
 optimizer = StochasticGradientDescent(

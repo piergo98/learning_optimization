@@ -6,6 +6,9 @@
 **/*.pyo
 **/*.pyd
 
+# Images folder
+images/
+
 # Figures files in all subdirectories
 **/*.eps
 **/*.pdf
@@ -16,3 +19,25 @@
 **/*.tiff
 **/*.bmp
 **/*.svg
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Data files
+*.mat
+*.pkl
+*.h5

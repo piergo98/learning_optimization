@@ -39,7 +39,7 @@ if torch.cuda.is_available():
 
 ```python
 import torch
-from sgd import torch_optimize
+from optimizers import torch_optimize
 
 # Your gradient function (must accept/return torch.Tensor)
 def my_gradient(params, indices=None, data=None):
@@ -88,7 +88,7 @@ Since CasADi doesn't run on GPU, wrap your CasADi functions to convert between N
 import casadi as ca
 import numpy as np
 import torch
-from sgd import torch_optimize
+from optimizers import torch_optimize
 
 # Create CasADi gradient function
 x = ca.SX.sym('x', n)
@@ -127,7 +127,7 @@ params_opt, history = torch_optimize(
 
 ### TorchSGD
 ```python
-from sgd import TorchSGD
+from optimizers import TorchSGD
 
 opt = TorchSGD(
     learning_rate=0.01,
@@ -141,7 +141,7 @@ params_opt, history = opt.optimize(params_init, gradient_func, n_epochs=100)
 
 ### TorchAdam
 ```python
-from sgd import TorchAdam
+from optimizers import TorchAdam
 
 opt = TorchAdam(
     learning_rate=0.001,
@@ -156,7 +156,7 @@ params_opt, history = opt.optimize(params_init, gradient_func, n_epochs=100)
 
 ### TorchRMSProp
 ```python
-from sgd import TorchRMSProp
+from optimizers import TorchRMSProp
 
 opt = TorchRMSProp(
     learning_rate=0.001,
@@ -174,7 +174,7 @@ params_opt, history = opt.optimize(params_init, gradient_func, n_epochs=100)
 Use `torch_optimize` to select optimizer by name:
 
 ```python
-from sgd import torch_optimize
+from optimizers import torch_optimize
 
 # Adam
 params_opt, history = torch_optimize(

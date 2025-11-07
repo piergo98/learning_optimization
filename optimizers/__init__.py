@@ -1,6 +1,10 @@
 """
-Stochastic Gradient Descent (SGD) module for optimization.
+Optimizers module for gradient-based optimization.
+
+Includes NumPy-based optimizers (SGD, Adam, RMSProp) and PyTorch GPU-accelerated versions.
 """
+
+__version__ = "0.1.0"
 
 from .sgd import (
     StochasticGradientDescent,
@@ -28,6 +32,7 @@ try:
     gpu_optimize = gpu_optimize
 
     __all__ = [
+        '__version__',
         'StochasticGradientDescent', 'sgd_optimize',
         'RMSPropOptimizer', 'AdamOptimizer', 'rmsprop_optimize', 'adam_optimize',
         'SGD', 'Adam', 'RMSProp', 'gpu_optimize',
@@ -36,6 +41,7 @@ try:
 except ImportError:
     _TORCH_AVAILABLE = False
     __all__ = [
+        '__version__',
         'StochasticGradientDescent', 'sgd_optimize',
         'RMSPropOptimizer', 'AdamOptimizer', 'rmsprop_optimize', 'adam_optimize',
         '_TORCH_AVAILABLE',

@@ -541,12 +541,15 @@ class AdamOptimizer:
         if self.weight_decay > 0:
             gradient = gradient + self.weight_decay * params
 
+        # Update biased first moment estimate (mean of gradients)
         self.m = self.beta1 * self.m + (1 - self.beta1) * gradient
+        # Update biased second moment estimate (uncentered variance of gradients)
         self.v = self.beta2 * self.v + (1 - self.beta2) * (gradient ** 2)
 
+        # Compute bias-corrected first and second moment estimates
         m_hat = self.m / (1 - self.beta1 ** self.t)
         v_hat = self.v / (1 - self.beta2 ** self.t)
-
+        # Update parameters
         params = params - self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
 
         return params
@@ -589,9 +592,11 @@ class AdamOptimizer:
                     batch_indices = indices[start_idx:end_idx]
                 else:
                     batch_indices = None
-
+                
+                # Compute gradient for this batch
                 gradient = gradient_func(params, indices=batch_indices, data=data)
                 epoch_gradients.append(gradient)
+                # Update parameters using the computed gradient
                 params = self.step(params, gradient)
 
             avg_gradient = np.mean(epoch_gradients, axis=0)

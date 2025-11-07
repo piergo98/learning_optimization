@@ -1,12 +1,58 @@
 # learning_optimization
+
 This repository contains algorithms and optimizer implementations for learning-based optimization of control inputs and mode durations in switched optimal control problems (switched OCP).
+
+## Installation
+
+### Quick Install
+
+```bash
+pip install -e .
+```
+
+### With GPU Support (PyTorch)
+
+```bash
+pip install -e .[gpu]
+```
+
+### With All Dependencies
+
+```bash
+pip install -e .[all]
+```
+
+See [INSTALL.md](INSTALL.md) for detailed installation instructions.
+
+## Quick Start
+
+```python
+from optimizers import sgd_optimize, adam_optimize
+import numpy as np
+
+# Define your gradient function
+def gradient_func(params, indices=None, data=None):
+    # Your gradient computation here
+    return 2 * params  # Example: gradient of ||params||^2
+
+# Initialize parameters
+params_init = np.random.randn(10)
+
+# Optimize using Adam
+params_opt, history = adam_optimize(
+    params_init=params_init,
+    gradient_func=gradient_func,
+    learning_rate=0.01,
+    n_epochs=100,
+    verbose=True
+)
+```
 
 ## Contents
 
-- `sgd/` — A flexible Stochastic Gradient Descent implementation (NumPy-based) with examples and utility functions.
-- `sgd/torch_optimizers.py` and `sgd/examples/torch_example.py` — PyTorch GPU-accelerated optimizers and examples for large-scale problems.
+- `optimizers/` — A flexible optimization library with NumPy-based and PyTorch GPU-accelerated optimizers (SGD, Adam, RMSProp).
 
-Below are the bundled README contents from the `sgd` subfolder: the plain SGD documentation followed by the PyTorch GPU-accelerated README. This wraps the inner docs so you can read usage and examples from the project root.
+Below are the bundled README contents from the `optimizers` subfolder: the plain SGD documentation followed by the PyTorch GPU-accelerated README. This wraps the inner docs so you can read usage and examples from the project root.
 
 ---
 
@@ -125,7 +171,7 @@ def gradient_wrapper(params_torch, indices=None, data=None):
 
 ### Examples
 
-See `sgd/examples/torch_example.py` for runnable demos (CPU vs GPU comparison, CasADi wrapper example, optimizer comparison, large-scale GPU example).
+See `sgd/gpu_example.py` for runnable demos (CPU vs GPU comparison, CasADi wrapper example, optimizer comparison, large-scale GPU example).
 
 ---
 

@@ -13,14 +13,38 @@ from optimizers import gpu_optimize
 
 # Check if CUDA is available
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
+# print(f"Using device: {device}")
+
 
 def switched_problem(n_phases=5):
     """
     Set up a switched linear problem and compute cost and gradient functions
     """
     model = {
-        'A': [np.array([[-0.1, 0, 0], [0, -2, -6.25], [0, 4, 0]])],
-        'B': [np.array([[0.25], [2], [0]])],
+        'A': [
+            np.array([[-2.5, 0.5, 0.3], [0.4, -2.0, 0.6], [0.2, 0.3, -1.8]]),
+            np.array([[-1.9, 3.2, 0.4], [0.3, -2.1, 0.5], [0, 0.6, -2.3]]),
+            np.array([[-2.2, 0, 0.5],   [0.2, -1.7, 0.4], [0.3, 0.2, -2.0]]),
+            np.array([[-1.8, 0.3, 0.2], [0.5, -2.4, 0],   [0.4, 0, -2.2]]),
+            np.array([[-2.0, 0.4, 0],   [0.3, -2.2, 0.2], [0.5, 0.3, -1.9]]),
+            np.array([[-2.3, 0.2, 0.3], [0, -2.0, 0.4],   [0.2, 0.5, -2.1]]),
+            np.array([[-1.7, 0.5, 0.4], [0.2, -2.5, 0.3], [1.1, 0.2, -2.4]]),
+            np.array([[-2.1, 0.3, 0.2], [0.4, -1.9, 0.5], [0.3, 0.1, -2.0]]),
+            np.array([[-2.4, 0, 0.5],   [0.2, -2.3, 0.3], [0.4, 0.2, -1.8]]),
+            np.array([[-1.8, 0.4, 0.3], [0.5, -2.1, 0.2], [0.2, 3.1, -2.2]]),
+        ],
+        'B': [
+            np.array([[1.5, 0.3], [0.4, 1.2], [0.2, 0.8]]),
+            np.array([[1.2, 0.5], [0.3, 0.9], [0.4, 1.1]]),
+            np.array([[1.0, 0.4], [0.5, 1.3], [0.3, 0.7]]),
+            np.array([[1.4, 0.2], [0.6, 1.0], [0.1, 0.9]]),
+            np.array([[1.3, 0.1], [0.2, 1.4], [0.5, 0.6]]),
+            np.array([[1.1, 0.3], [0.4, 1.5], [0.2, 0.8]]),
+            np.array([[1.6, 0.2], [0.3, 1.1], [0.4, 0.7]]),
+            np.array([[1.0, 0.4], [0.5, 1.2], [0.3, 0.9]]),
+            np.array([[1.2, 0.5], [0.1, 1.3], [0.6, 0.8]]),
+            np.array([[1.4, 0.3], [0.2, 1.0], [0.5, 0.7]]),
+        ],
     }
 
     n_states = model['A'][0].shape[0]
@@ -28,7 +52,7 @@ def switched_problem(n_phases=5):
 
     time_horizon = 10
 
-    x0 = np.array([1.3440, -4.5850, 5.6470])
+    x0 = np.array([2, -1, 5])
     
     xr = np.array([1, -3])
     
@@ -43,12 +67,11 @@ def switched_problem(n_phases=5):
     # Load model
     swi_lin.load_model(model)
 
-    Q = 1. * np.eye(n_states)
-    R = 0.1 * np.eye(n_inputs)
-    # Solve the Algebraic Riccati Equation
-    P = np.array(solve_continuous_are(model['A'][0], model['B'][0], Q, R))
+    Q = 10. * np.eye(n_states)
+    R = 10. * np.eye(n_inputs)
+    E = 1. * np.eye(n_states)
 
-    swi_lin.precompute_matrices(x0, Q, R, P)
+    swi_lin.precompute_matrices(x0, Q, R, E)
     x0 = np.append(x0, 1)  # augment with 1 for affine term
     J_func = swi_lin.cost_function(R, x0)
         
@@ -60,7 +83,7 @@ def switched_problem(n_phases=5):
         du, d_delta = swi_lin.grad_cost_function(k, R)
         # print(f"Length du: {len(du)}")
 
-        grad_J_u.append(*du)
+        grad_J_u += du
         grad_J_delta.append(d_delta)
 
     grad_J = ca.vertcat(*grad_J_delta, *grad_J_u)
@@ -81,20 +104,23 @@ def switched_problem(n_phases=5):
         """
         # Wrapper that convert torch -> numpy -> CasADi -> numpy -> torch
         params_np = params.detach().cpu().numpy()
+        # From a single flattened params vector, unpack into controls and durations
+        u = params_np[:n_phases * n_inputs].reshape((n_phases, n_inputs)).tolist()
+        phases_duration = params_np[n_phases * n_inputs:].reshape((n_phases,)).tolist()
+        params_list = u + phases_duration
         # Compute the cost function for a single example (no batch)
-        J_np = float(J_func(*params_np).full().item())
-        # J_np = 0
+        J_np = float(J_func(*params_list).full().item())
         
         if data is not None:
-            u = data['controls']
-            phases_duration = data['phases_duration']
-            params_ref = np.concatenate([u.ravel(), phases_duration.ravel()])
+            u = data['controls'].ravel()
+            phases_duration = data['phases_duration'].ravel()
+            params_ref = np.concatenate([u, phases_duration])
             # print(f"Reference params: {params_ref}")
             
             # Compute the loss wrt reference params
             params_ref = np.asarray(params_ref)
             # add numpy sum of squared differences to scalar loss
-            J_np += float(np.sum((params_np - params_ref) ** 2))
+            J_np += float(np.sum((params_np - params_ref) ** 2) / len(params_ref))
             
         # Convert back to torch tensor on same device as input
         J = torch.tensor(J_np, dtype=torch.float32, device=params.device)
@@ -109,13 +135,17 @@ def switched_problem(n_phases=5):
         """
         # Wrapper that convert torch -> numpy -> CasADi -> numpy -> torch
         params_np = params.detach().cpu().numpy()
+        # From a single flattened params vector, unpack into controls and durations
+        u = params_np[:n_phases * n_inputs].reshape((n_phases, n_inputs)).tolist()
+        phases_duration = params_np[n_phases * n_inputs:].reshape((n_phases,)).tolist()
+        params_list = u + phases_duration
         # single example
-        grad_J_np = np.asarray(grad_J_func(*params_np).full().ravel())
+        grad_J_np = np.asarray(grad_J_func(*params_list).full().ravel())
         
         if data is not None:
-            u = data['controls']
-            phases_duration = data['phases_duration']
-            params_ref = np.concatenate([u.ravel(), phases_duration.ravel()])
+            u = data['controls'].ravel()
+            phases_duration = data['phases_duration'].ravel()
+            params_ref = np.concatenate([u, phases_duration])
             params_ref = np.asarray(params_ref)
             # add gradient of the squared differences to grad_J
             grad_J_np += 2 * (params_np - params_ref)
@@ -131,23 +161,23 @@ def params_optimization(optimizer="sgd", data=None):
     """
     Perform optimization using the switched linear problem setup.
     """
-    n_phases = 80
+    n_phases = 50
 
     _, _, cost_function, gradient_function = switched_problem(n_phases)
     
     # If data is provided, build the initial parameters by perturbating the reference
     if data is not None:
-        u = data['controls']
-        phases_duration = data['phases_duration']
-        true_params = np.concatenate([u.ravel(), phases_duration.ravel()])
+        u = data['controls'].ravel()
+        phases_duration = data['phases_duration'].ravel()
+        true_params = np.concatenate([u, phases_duration])
         # Add some noise to the initial parameters
         initial_params = np.random.normal(true_params, 0.1, true_params.shape)
     else:
-        initial_params = np.zeros(n_phases * (1 + 1))  # 1 inputs + 1 duration per phase
+        initial_params = np.ones(n_phases * (2 + 1))  # 2 inputs + 1 duration per phase
         
     # Evaluate initial cost and gradient
-    initial_cost = cost_function(torch.tensor(initial_params, dtype=torch.float32, device=device), data=data).item()
-    initial_grad = gradient_function(torch.tensor(initial_params, dtype=torch.float32, device=device), data=data).cpu().numpy()
+    # initial_cost = cost_function(torch.tensor(initial_params, dtype=torch.float32, device=device), data=data).item()
+    # initial_grad = gradient_function(torch.tensor(initial_params, dtype=torch.float32, device=device), data=data).cpu().numpy()
     # print("Initial parameters:", initial_params)
     # print(f"Initial cost: {initial_cost}")
     # print(f"Initial gradient norm: {np.linalg.norm(initial_grad)}")
@@ -177,8 +207,8 @@ def params_optimization(optimizer="sgd", data=None):
             gradient_func=gradient_function,
             optimizer=optimizer,
             loss_func=cost_function,  # optional
-            learning_rate=1e-4,
-            n_epochs=1000,
+            learning_rate=5e-5,
+            n_epochs=int(1e5),
             data=data,
             device=device,
             verbose=True,
@@ -190,8 +220,10 @@ def params_optimization(optimizer="sgd", data=None):
         params_optimized = params_optimized.detach().cpu().numpy()
 
     # Print results
-    print("Optimized Parameters:", params_optimized)
-    plot_params(params_optimized, n_phases)
+    # print("Optimized Parameters:", params_optimized)
+    # Get n_inputs from data or infer from params shape
+    n_inputs = data['n_inputs'] if data is not None else 2
+    plot_params(params_optimized, n_phases, n_inputs)
     plot_history(history)
     
 def plot_history(history):
@@ -224,27 +256,42 @@ def plot_history(history):
     plt.tight_layout(rect=[0, 0, 1, 0.96])
     plt.show()
     
-def plot_params(params_optimized, n_phases):
+def plot_params(params_optimized, n_phases, n_inputs=1):
     """
     Plot the optimized parameters (inputs and durations) over phases.
+    
+    Args:
+        params_optimized: flattened array [u_0_0, u_0_1, ..., u_{n-1}_0, u_{n-1}_1, delta_0, ..., delta_{n-1}]
+        n_phases: number of phases
+        n_inputs: number of control inputs per phase
     """
-    inputs = params_optimized[:n_phases]
-    durations = params_optimized[n_phases:]
+    # Split into controls and durations
+    n_control_params = n_phases * n_inputs
+    controls = params_optimized[:n_control_params].reshape((n_phases, n_inputs))
+    durations = params_optimized[n_control_params:]
 
-    fig, axes = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
+    # Create subplots: n_inputs plots for controls + 1 for durations
+    fig, axes = plt.subplots(n_inputs + 1, 1, figsize=(10, 3 * (n_inputs + 1)), sharex=True)
+    
+    # If only one subplot, axes is not an array
+    if n_inputs == 0:
+        axes = [axes]
 
-    # Inputs
-    axes[0].step(range(n_phases), inputs, where='post', color='tab:orange', lw=2)
-    axes[0].set_ylabel('Control Input')
-    axes[0].set_title('Optimized Control Inputs over Phases')
-    axes[0].grid(True)
+    # Plot each control input
+    colors = ['tab:orange', 'tab:cyan', 'tab:green', 'tab:red']
+    for i in range(n_inputs):
+        axes[i].step(range(n_phases), controls[:, i], where='post', 
+                     color=colors[i % len(colors)], lw=2)
+        axes[i].set_ylabel(f'Control Input {i+1}')
+        axes[i].set_title(f'Optimized Control Input {i+1} over Phases')
+        axes[i].grid(True)
 
-    # Durations
-    axes[1].step(range(n_phases), durations, where='post', color='tab:purple', lw=2)
-    axes[1].set_ylabel('Phase Duration')
-    axes[1].set_xlabel('Phase')
-    axes[1].set_title('Optimized Phase Durations over Phases')
-    axes[1].grid(True)
+    # Plot durations
+    axes[n_inputs].step(range(n_phases), durations, where='post', color='tab:purple', lw=2)
+    axes[n_inputs].set_ylabel('Phase Duration')
+    axes[n_inputs].set_xlabel('Phase')
+    axes[n_inputs].set_title('Optimized Phase Durations over Phases')
+    axes[n_inputs].grid(True)
 
     plt.tight_layout()
     plt.show()
@@ -268,15 +315,25 @@ def load_data(filename):
     keys_to_keep = ['n_phases', 'controls', 'phases_duration']
 
     data = {k: loaded_data[k] for k in keys_to_keep}
+    # Normalize and reshape controls into shape (n_inputs, n_phases)
+    controls = np.asarray(data['controls']).ravel()
+    n_phases = int(np.squeeze(np.asarray(data['n_phases'])))
+    if controls.size % n_phases != 0:
+        raise ValueError(f"Controls length ({controls.size}) is not divisible by n_phases ({n_phases}).")
+    n_inputs = controls.size // n_phases
+    controls = controls.reshape((n_inputs, n_phases))
+    data['n_inputs'] = n_inputs
+
+    # Ensure phases_duration is a 1D array
+    data['phases_duration'] = np.asarray(data['phases_duration']).ravel()
     # print(data)
 
     return data
 
-    # return data
 if __name__ == "__main__":
-    data_file = "optimal_params.mat"
+    data_file = "example_1_paper_NAHS.mat"
     data = load_data(data_file)
     
     optimizer = "adam"
-    params_optimization(optimizer, data)
+    params_optimization(optimizer)
 
