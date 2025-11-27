@@ -26,6 +26,8 @@ See [INSTALL.md](INSTALL.md) for detailed installation instructions.
 
 ## Quick Start
 
+### Optimization
+
 ```python
 from optimizers import sgd_optimize, adam_optimize
 import numpy as np
@@ -48,9 +50,36 @@ params_opt, history = adam_optimize(
 )
 ```
 
+### Neural Network Training
+
+```python
+from optimizers.neural_network import NeuralNetworkNumPy, train_neural_network_numpy
+import numpy as np
+
+# Create a neural network
+network = NeuralNetworkNumPy(
+    layer_sizes=[784, 128, 64, 10],  # Input -> Hidden -> Output
+    activation='relu',
+    output_activation='softmax'
+)
+
+# Train with custom optimizer
+params_opt, history = train_neural_network_numpy(
+    network=network,
+    X_train=X_train,
+    y_train=y_train,
+    optimizer='adam',
+    learning_rate=0.001,
+    n_epochs=50,
+    batch_size=32
+)
+```
+
 ## Contents
 
 - `optimizers/` — A flexible optimization library with NumPy-based and PyTorch GPU-accelerated optimizers (SGD, Adam, RMSProp).
+- `optimizers/neural_network.py` — Neural network training utilities with support for custom optimizers.
+- [NEURAL_NETWORK_EXAMPLES.md](NEURAL_NETWORK_EXAMPLES.md) — Comprehensive examples for neural network training.
 
 Below are the bundled README contents from the `optimizers` subfolder: the plain SGD documentation followed by the PyTorch GPU-accelerated README. This wraps the inner docs so you can read usage and examples from the project root.
 

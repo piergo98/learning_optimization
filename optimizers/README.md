@@ -13,8 +13,11 @@ This folder contains a flexible implementation of the Stochastic Gradient Descen
 
 ## Files
 
-- `sgd.py`: Main implementation of the SGD algorithm
+- `sgd.py`: Main implementation of the SGD algorithm and variants (Adam, RMSProp)
+- `optimizers.py`: PyTorch GPU-accelerated optimizers
+- `neural_network.py`: Neural network training utilities with custom optimizers
 - `example.py`: Comprehensive examples demonstrating various use cases
+- `torch_example.py`: PyTorch GPU examples
 - `__init__.py`: Package initialization
 - `README.md`: This file
 

@@ -17,38 +17,16 @@ def switched_problem(n_phases=5):
     Set up a switched linear problem and compute cost and gradient functions
     """
     model = {
-        'A': [
-            np.array([[-2.5, 0.5, 0.3], [0.4, -2.0, 0.6], [0.2, 0.3, -1.8]]),
-            np.array([[-1.9, 3.2, 0.4], [0.3, -2.1, 0.5], [0, 0.6, -2.3]]),
-            np.array([[-2.2, 0, 0.5],   [0.2, -1.7, 0.4], [0.3, 0.2, -2.0]]),
-            np.array([[-1.8, 0.3, 0.2], [0.5, -2.4, 0],   [0.4, 0, -2.2]]),
-            np.array([[-2.0, 0.4, 0],   [0.3, -2.2, 0.2], [0.5, 0.3, -1.9]]),
-            np.array([[-2.3, 0.2, 0.3], [0, -2.0, 0.4],   [0.2, 0.5, -2.1]]),
-            np.array([[-1.7, 0.5, 0.4], [0.2, -2.5, 0.3], [1.1, 0.2, -2.4]]),
-            np.array([[-2.1, 0.3, 0.2], [0.4, -1.9, 0.5], [0.3, 0.1, -2.0]]),
-            np.array([[-2.4, 0, 0.5],   [0.2, -2.3, 0.3], [0.4, 0.2, -1.8]]),
-            np.array([[-1.8, 0.4, 0.3], [0.5, -2.1, 0.2], [0.2, 3.1, -2.2]]),
-        ],
-        'B': [
-            np.array([[1.5, 0.3], [0.4, 1.2], [0.2, 0.8]]),
-            np.array([[1.2, 0.5], [0.3, 0.9], [0.4, 1.1]]),
-            np.array([[1.0, 0.4], [0.5, 1.3], [0.3, 0.7]]),
-            np.array([[1.4, 0.2], [0.6, 1.0], [0.1, 0.9]]),
-            np.array([[1.3, 0.1], [0.2, 1.4], [0.5, 0.6]]),
-            np.array([[1.1, 0.3], [0.4, 1.5], [0.2, 0.8]]),
-            np.array([[1.6, 0.2], [0.3, 1.1], [0.4, 0.7]]),
-            np.array([[1.0, 0.4], [0.5, 1.2], [0.3, 0.9]]),
-            np.array([[1.2, 0.5], [0.1, 1.3], [0.6, 0.8]]),
-            np.array([[1.4, 0.3], [0.2, 1.0], [0.5, 0.7]]),
-        ],
+        'A': [np.array([[-0.1, 0, 0], [0, -2, -6.25], [0, 4, 0]])],
+        'B': [np.array([[0.25], [2], [0]])],
     }
 
     n_states = model['A'][0].shape[0]
     n_inputs = model['B'][0].shape[1]
 
     time_horizon = 10
-
-    x0 = np.array([2, -1, 5])
+    
+    x0 = np.array([1.3440, -4.5850, 5.6470])
     
     xr = np.array([1, -3])
     
@@ -63,11 +41,13 @@ def switched_problem(n_phases=5):
     # Load model
     swi_lin.load_model(model)
 
-    Q = 10. * np.eye(n_states)
-    R = 10. * np.eye(n_inputs)
-    E = 1. * np.eye(n_states)
+    Q = 1. * np.eye(n_states)
+    R = 0.1 * np.eye(n_inputs)
+    # Solve the Algebraic Riccati Equation
+    P = np.array(solve_continuous_are(model['A'][0], model['B'][0], Q, R))
 
-    swi_lin.precompute_matrices(x0, Q, R, E)
+
+    swi_lin.precompute_matrices(x0, Q, R, P)
     x0 = np.append(x0, 1)  # augment with 1 for affine term
     J_func = swi_lin.cost_function(R, x0)
         
@@ -91,14 +71,6 @@ def switched_problem(n_phases=5):
     # Create a CasADi function for the gradient
     grad_J_func = ca.Function('grad_J', [*swi_lin.u, *swi_lin.delta], [grad_J])
     
-    def softmax(theta):
-        e = np.exp(theta)
-        return e / np.sum(e)
-
-    def softmax_jacobian(theta):
-        s = softmax(theta)
-        return np.diag(s) - np.outer(s, s)
-    
     # Create wrapper functions for the optimizer
     def cost_function(params, indices=None, data=None):
         """
@@ -113,9 +85,6 @@ def switched_problem(n_phases=5):
         params_list = u + phases_duration
         # Compute the cost function for a single example (no batch)
         J = float(J_func(*params_list).full().item())
-        # add a softmax penalty to enforce positive durations
-        # print(softmax(phases_duration))
-        # input()
         
         if data is not None:
             u = data['controls'].ravel()
@@ -126,7 +95,7 @@ def switched_problem(n_phases=5):
             # Compute the loss wrt reference params
             params_ref = np.asarray(params_ref)
             # add numpy sum of squared differences to scalar loss
-            J += float(np.sum((params - params_ref) ** 2) / len(params_ref))
+            J += float(np.sum((params - params_ref) ** 2))
 
         return J
 
@@ -144,15 +113,13 @@ def switched_problem(n_phases=5):
         # single example
         grad_J = np.asarray(grad_J_func(*params_list).full().ravel())
         
-        
-
         if data is not None:
             u = data['controls'].ravel()
             phases_duration = data['phases_duration'].ravel()
             params_ref = np.concatenate([u, phases_duration])
             params_ref = np.asarray(params_ref)
             # add gradient of the squared differences to grad_J
-            grad_J += 2 * (params - params_ref) / len(params_ref)
+            grad_J += 2 * (params - params_ref)
 
         return grad_J
 
@@ -163,19 +130,38 @@ def params_optimization(optimizer="sgd", data=None):
     """
     Perform optimization using the switched linear problem setup.
     """
-    n_phases = 50
+    n_phases = 80
 
     _, _, cost_function, gradient_function = switched_problem(n_phases)
     
     # If data is provided, build the initial parameters by perturbating the reference
-    if data is not None:
+    if  None:
         u = data['controls']
         phases_duration = data['phases_duration']
         true_params = np.concatenate([u.ravel(), phases_duration.ravel()])
         # Add some noise to the initial parameters
         initial_params = np.random.normal(true_params, 0.1, true_params.shape)
+        # Ensure phase durations are non-negative by flooring to a small positive value
+        n_control_params = n_phases * data['n_inputs']
+        controls_init = initial_params[:n_control_params].astype(float)
+        durations_init = initial_params[n_control_params:].astype(float)
+        eps = 1e-6
+        durations_init = np.maximum(durations_init, eps)
+        initial_params = np.concatenate([controls_init, durations_init])
+        
     else:
-        initial_params = np.zeros(n_phases * (2 + 1))  # 2 inputs + 1 duration per phase
+        # initial inputs are zero, initial durations split the time_horizon evenly across phases
+        n_inputs = 1
+        time_horizon = 10.0  # same horizon used in switched_problem
+        controls_init = np.zeros(n_phases * n_inputs, dtype=float)
+        durations_init = np.full(n_phases, time_horizon / float(n_phases), dtype=float)
+        initial_params = np.concatenate([controls_init, durations_init])
+        
+    # Create a mask matrix to extract delta parameters
+    n_control_params = n_phases * (data['n_inputs'] if data is not None else 1)
+    n_params = n_control_params + n_phases
+    delta_mask = np.zeros(n_params, dtype=float)
+    delta_mask[n_control_params:] = 1.0
 
     # Choose learning rate schedule
     schedules = [
@@ -184,14 +170,14 @@ def params_optimization(optimizer="sgd", data=None):
         {'name': 'Exponential', 'schedule': 'exponential', 'params': {'decay_rate': 0.05}},
         {'name': 'Inverse', 'schedule': 'inverse', 'params': {'decay_rate': 0.1}},
     ]
-    schedule = schedules[2]['schedule']
-    params = schedules[2].get('params', {})
+    schedule = schedules[0]['schedule']
+    params = schedules[0].get('params', {})
 
     if optimizer == "sgd":
         params_optimized, history = sgd_optimize(
                 params_init=initial_params,
                 gradient_func=gradient_function,
-                loss_func=cost_function,  # optional
+                loss_func=cost_function,  
                 learning_rate=0.001,
                 n_epochs=1000,
                 learning_rate_schedule=schedule,
@@ -202,7 +188,7 @@ def params_optimization(optimizer="sgd", data=None):
         params_optimized, history = rmsprop_optimize(
                 params_init=initial_params,
                 gradient_func=gradient_function,
-                loss_func=cost_function,  # optional
+                loss_func=cost_function,  
                 learning_rate=0.001,
                 n_epochs=1000,
                 learning_rate_schedule=schedule,
@@ -215,8 +201,8 @@ def params_optimization(optimizer="sgd", data=None):
         params_optimized, history = adam_optimize(
                 params_init=initial_params,
                 gradient_func=gradient_function,
-                loss_func=cost_function,  # optional
-                learning_rate=3e-4,
+                loss_func=cost_function,
+                learning_rate=0.001,
                 n_epochs=1000,
                 learning_rate_schedule=schedule,
                 schedule_params=params,
@@ -224,13 +210,15 @@ def params_optimization(optimizer="sgd", data=None):
                 beta2=0.999,
                 eps=1e-8,
                 data=data,
+                delta_mask=delta_mask,
+                time_horizon=time_horizon,
         )
     else:
         raise ValueError(f"Unknown optimizer: {optimizer}")
     
     # Print results
-    print("Optimized Parameters:", params_optimized)
-    n_inputs = data['n_inputs'] if data is not None else 2
+    # print("Optimized Parameters:", params_optimized)
+    n_inputs = data['n_inputs'] if data is not None else 1
     plot_params(params_optimized, n_phases, n_inputs, save_figure=False)
     plot_history(history, save_figure=False)
     
@@ -400,7 +388,7 @@ def load_data(filename):
 
     # return data
 if __name__ == "__main__":
-    data_file = "example_1_paper_NAHS.mat"
+    data_file = "optimal_params.mat"
     data = load_data(data_file)
     
     optimizer = "adam"

@@ -534,7 +534,20 @@ class AdamOptimizer:
         if self.v is None:
             self.v = np.zeros_like(params)
 
-    def step(self, params: np.ndarray, gradient: np.ndarray) -> np.ndarray:
+    def step(self, params: np.ndarray, gradient: np.ndarray, delta_mask: Optional[np.ndarray] = None, time_horizon: Optional[float] = None) -> np.ndarray:
+        """
+        This method performs a single Adam update step.
+        Parameters
+        ----------
+        params : np.ndarray
+            Current parameters.
+        gradient : np.ndarray
+            Gradient of the loss with respect to parameters.
+        Returns
+        -------
+        np.ndarray
+            Updated parameters.
+        """
         self._init_state(params)
         self.t += 1
 
@@ -551,7 +564,20 @@ class AdamOptimizer:
         v_hat = self.v / (1 - self.beta2 ** self.t)
         # Update parameters
         params = params - self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
-
+        
+        # Since params are organized as \theta = [u, delta], we can project delta to the constraint set
+        if delta_mask is not None:
+            n_phases = int(np.sum(delta_mask))
+            delta = delta_mask * params
+            # Project to non-negative
+            delta = np.maximum(delta, 0)
+            # Also ensure that the sum of delta equals total_time_horizon
+            sum_delta = np.sum(delta)
+            delta = delta * (time_horizon / sum_delta)
+        
+            # Reconstruct params
+            params = params * (1 - delta_mask) + delta
+            
         return params
 
     def optimize(self, *args, **kwargs):
@@ -566,6 +592,8 @@ class AdamOptimizer:
         verbose = kwargs.get('verbose', True)
         tol = kwargs.get('tol', 1e-6)
         patience = kwargs.get('patience', None)
+        delta_mask = kwargs.get('delta_mask', None)
+        time_horizon = kwargs.get('time_horizon', None)
 
         params = params_init.copy()
         best_loss = float('inf')
@@ -597,7 +625,7 @@ class AdamOptimizer:
                 gradient = gradient_func(params, indices=batch_indices, data=data)
                 epoch_gradients.append(gradient)
                 # Update parameters using the computed gradient
-                params = self.step(params, gradient)
+                params = self.step(params, gradient, delta_mask=delta_mask, time_horizon=time_horizon)
 
             avg_gradient = np.mean(epoch_gradients, axis=0)
             gradient_norm = np.linalg.norm(avg_gradient)
@@ -751,6 +779,8 @@ def adam_optimize(
     verbose: bool = True,
     tol: float = 1e-6,
     patience: Optional[int] = None,
+    delta_mask: Optional[np.ndarray] = None,
+    time_horizon: Optional[float] = None,
 ) -> Tuple[np.ndarray, Dict]:
     """Convenience wrapper for Adam optimization."""
     optimizer = AdamOptimizer(
@@ -774,4 +804,6 @@ def adam_optimize(
         verbose=verbose,
         tol=tol,
         patience=patience,
+        delta_mask=delta_mask,
+        time_horizon=time_horizon,
     )
