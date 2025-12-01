@@ -12,6 +12,7 @@ Features:
 """
 import casadi as ca
 import numpy as np
+import os, subprocess, sys
 from typing import Optional, Callable, Tuple, Dict, List
 import warnings
 
@@ -24,8 +25,12 @@ except ImportError:
     TORCH_AVAILABLE = False
     warnings.warn("PyTorch not available. GPU training will not be available.")
     
+from c2t import c2t
 from ocslc.switched_linear_mpc import SwiLin
 from optimizers import gpu_optimize
+
+# Import torch generated files
+sys.path.insert(0, './torch_lib')
 
 
 # ============================================================================
@@ -59,13 +64,13 @@ if TORCH_AVAILABLE:
             super().__init__()
             
             # Build switched linear problem
-            n_phases = 50
-            _, _, cost_function, gradient_function = self.switched_problem(n_phases)
+            self.n_phases = 50
+            self.sys, _ = self.switched_problem(self.n_phases)
             
             self.layer_sizes = layer_sizes
             self.activation = activation
             self.output_activation = output_activation
-            
+
             # Build layers
             self.layers = nn.ModuleList()
             for i in range(len(layer_sizes) - 1):
@@ -127,26 +132,20 @@ if TORCH_AVAILABLE:
             swi_lin.precompute_matrices(x0, Q, R, E)
             x0 = np.append(x0, 1)  # augment with 1 for affine term
             J_func = swi_lin.cost_function(R, x0)
+            # Save the cost function 
+            J_func.save(os.path.join("./casadi_functions", 'J.casadi'))
                 
-            grad_J_u = []
-            grad_J_delta = []
-
-            for k in range(n_phases):
-                # Compute gradient of the cost
-                du, d_delta = swi_lin.grad_cost_function(k, R)
-                # print(f"Length du: {len(du)}")
-
-                grad_J_u += du
-                grad_J_delta.append(d_delta)
-
-            grad_J = ca.vertcat(*grad_J_delta, *grad_J_u)
-
-            # keep the original stacked forms if needed
-            grad_J_u = np.hstack(grad_J_u)
-            grad_J_delta = np.hstack(grad_J_delta)
+            # Compile the saved CasADi functions using the c2t.py script
+            print("Compiling CasADi functions using c2t.py...")
+            casadi_functions_dir = os.path.abspath("./casadi_functions")
+            output_dir = os.path.abspath("./torch_lib")
+    
+            # ==================== Execute Code Generation ====================
+            c2t(casadi_functions_dir, output_dir)
+            print("CasADi functions compiled and saved to torch_lib/")
             
-            # Create a CasADi function for the gradient
-            grad_J_func = ca.Function('grad_J', [*swi_lin.u, *swi_lin.delta], [grad_J])
+            
+            return swi_lin, x0
         
         def forward(self, x):
             """Forward pass."""
@@ -247,11 +246,22 @@ if TORCH_AVAILABLE:
         
         n_samples = X_train.shape[0]
         
-        # Loss function
-        if network.output_activation == 'softmax':
-            criterion = nn.CrossEntropyLoss()
-        else:
-            criterion = nn.MSELoss()
+        ## Loss function
+        from torch_lib.gen_file_torch import run_cost
+        # if network.output_activation == 'softmax':
+        #     criterion = nn.CrossEntropyLoss()
+        # else:
+        #     criterion = nn.MSELoss()
+        
+        # Create a dict mapping input_name to tensor shape
+        nnz_u = network.sys.n_inputs
+        nnz_d = 1
+        # inputs = {}
+        # for i in range(network.n_phases):
+        #     nnz_d += nnz_u  # control inputs for each phase
+        
+        
+        
         
         # Gradient function
         def gradient_func(params, indices=None, data=None):
@@ -266,7 +276,8 @@ if TORCH_AVAILABLE:
                 y_batch = y_train
             
             output = network(X_batch)
-            
+            print(f"Output shape: {output.shape}")
+            input("Press Enter to continue...")
             # Compute Jacobian: derivative of each output w.r.t. parameters
             # Sum the output over the batch dimension to get a scalar loss
             jacobian = []
@@ -286,6 +297,8 @@ if TORCH_AVAILABLE:
             jacobian = torch.stack(jacobian)  # Shape: (n_outputs, n_params)
             
             # Include the derivative of the loss w.r.t. the outputs of the NN
+            
+            
             
             if network.output_activation == 'softmax' and y_batch.dtype == torch.long:
                 loss = criterion(output, y_batch)
