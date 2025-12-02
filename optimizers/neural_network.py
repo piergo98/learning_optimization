@@ -10,7 +10,6 @@ Features:
 - Training utilities and helper functions
 - Integration with PyTorch for GPU acceleration
 """
-import casadi as ca
 import numpy as np
 import os, subprocess, sys
 from typing import Optional, Callable, Tuple, Dict, List
@@ -25,12 +24,8 @@ except ImportError:
     TORCH_AVAILABLE = False
     warnings.warn("PyTorch not available. GPU training will not be available.")
     
-from c2t import c2t
-from ocslc.switched_linear_mpc import SwiLin
+from switched_linear_torch import SwiLin
 from optimizers import gpu_optimize
-
-# Import torch generated files
-sys.path.insert(0, './torch_lib')
 
 
 # ============================================================================
@@ -58,13 +53,14 @@ if TORCH_AVAILABLE:
         def __init__(
             self,
             layer_sizes: List[int],
+            n_phases: int,
             activation: str = 'relu',
-            output_activation: str = 'softmax'
+            output_activation: str = 'linear'
         ):
             super().__init__()
             
             # Build switched linear problem
-            self.n_phases = 50
+            self.n_phases = n_phases
             self.sys, _ = self.switched_problem(self.n_phases)
             
             self.layer_sizes = layer_sizes
@@ -108,7 +104,7 @@ if TORCH_AVAILABLE:
             n_states = model['A'][0].shape[0]
             n_inputs = model['B'][0].shape[1]
 
-            time_horizon = 10
+            self.time_horizon = 2
 
             x0 = np.array([2, -1, 5])
             
@@ -118,7 +114,7 @@ if TORCH_AVAILABLE:
                 n_phases, 
                 n_states,
                 n_inputs,
-                time_horizon, 
+                self.time_horizon, 
                 auto=False, 
             )
             
@@ -130,22 +126,13 @@ if TORCH_AVAILABLE:
             E = 1. * np.eye(n_states)
 
             swi_lin.precompute_matrices(x0, Q, R, E)
-            x0 = np.append(x0, 1)  # augment with 1 for affine term
-            J_func = swi_lin.cost_function(R, x0)
-            # Save the cost function 
-            J_func.save(os.path.join("./casadi_functions", 'J.casadi'))
-                
-            # Compile the saved CasADi functions using the c2t.py script
-            print("Compiling CasADi functions using c2t.py...")
-            casadi_functions_dir = os.path.abspath("./casadi_functions")
-            output_dir = os.path.abspath("./torch_lib")
-    
-            # ==================== Execute Code Generation ====================
-            c2t(casadi_functions_dir, output_dir)
-            print("CasADi functions compiled and saved to torch_lib/")
+            x0_aug = np.append(x0, 1)  # augment with 1 for affine term
             
+            # Store the cost function (now returns a callable)
+            self.cost_func = swi_lin.cost_function(R, sym_x0=True)
+            self.R = R
             
-            return swi_lin, x0
+            return swi_lin, x0_aug
         
         def forward(self, x):
             """Forward pass."""
@@ -190,7 +177,7 @@ if TORCH_AVAILABLE:
     def train_neural_network(
         network: SwiLinNN,
         X_train: torch.Tensor,
-        y_train: torch.Tensor,
+        y_train: Optional[torch.Tensor] = None,
         X_val: Optional[torch.Tensor] = None,
         y_val: Optional[torch.Tensor] = None,
         optimizer: str = 'adam',
@@ -238,100 +225,135 @@ if TORCH_AVAILABLE:
         
         network = network.to(device)
         X_train = X_train.to(device)
-        y_train = y_train.to(device)
         
         if X_val is not None:
             X_val = X_val.to(device)
-            y_val = y_val.to(device)
         
         n_samples = X_train.shape[0]
-        
-        ## Loss function
-        from torch_lib.gen_file_torch import run_cost
-        # if network.output_activation == 'softmax':
-        #     criterion = nn.CrossEntropyLoss()
-        # else:
-        #     criterion = nn.MSELoss()
-        
-        # Create a dict mapping input_name to tensor shape
-        nnz_u = network.sys.n_inputs
-        nnz_d = 1
-        # inputs = {}
-        # for i in range(network.n_phases):
-        #     nnz_d += nnz_u  # control inputs for each phase
-        
-        
-        
+        n_inputs = network.sys.n_inputs
         
         # Gradient function
         def gradient_func(params, indices=None, data=None):
+            """Compute gradient of loss w.r.t. network parameters."""
             network.set_flat_params(params)
             network.zero_grad()
             
             if indices is not None:
                 X_batch = X_train[indices]
-                y_batch = y_train[indices]
             else:
                 X_batch = X_train
-                y_batch = y_train
             
+            batch_size = X_batch.shape[0]
             output = network(X_batch)
-            print(f"Output shape: {output.shape}")
-            input("Press Enter to continue...")
-            # Compute Jacobian: derivative of each output w.r.t. parameters
-            # Sum the output over the batch dimension to get a scalar loss
-            jacobian = []
-            for i in range(output.shape[1] if output.dim() > 1 else 1):
-                network.zero_grad()
-                if output.dim() > 1:
-                    output[:, i].sum().backward(retain_graph=True)
-                else:
-                    output.sum().backward(retain_graph=True)
-                
-                grads_i = []
-                for param in network.parameters():
-                    if param.grad is not None:
-                        grads_i.append(param.grad.view(-1).clone())
-                jacobian.append(torch.cat(grads_i))
+            
+            # Apply transformation: T * softmax(output[-n_phases:]) for the deltas
+            T_tensor = torch.tensor(network.sys.time_horizon, device=output.device, dtype=output.dtype)
 
-            jacobian = torch.stack(jacobian)  # Shape: (n_outputs, n_params)
-            
-            # Include the derivative of the loss w.r.t. the outputs of the NN
-            
-            
-            
-            if network.output_activation == 'softmax' and y_batch.dtype == torch.long:
-                loss = criterion(output, y_batch)
+            # Handle batch dimension properly
+            if output.dim() == 1:
+                # Single sample case
+                # Output format: [u_1_1, u_1_2, ..., u_n_1, u_n_2, ..., delta_1, ..., delta_n]
+                # Controls: first n_phases * n_inputs elements
+                # Deltas: last n_phases elements
+                n_control_outputs = network.n_phases * n_inputs
+                controls = output[:n_control_outputs]
+                delta_raw = output[n_control_outputs:]
+                
+                # Apply softmax and scale deltas
+                delta_normalized = F.softmax(delta_raw, dim=-1)
+                deltas = delta_normalized * T_tensor
+                
+                transformed_output = torch.cat([controls, deltas], dim=0)
             else:
-                loss = criterion(output, y_batch)
+                # Batch case
+                n_control_outputs = network.n_phases * n_inputs
+                controls = output[:, :n_control_outputs]
+                delta_raw = output[:, n_control_outputs:]
+                
+                # Apply softmax and scale deltas
+                delta_normalized = F.softmax(delta_raw, dim=-1)
+                deltas = delta_normalized * T_tensor
+                
+                transformed_output = torch.cat([controls, deltas], dim=-1)
             
-            print(f"Loss: {loss.item()}")
-            print(f"Loss shape: {loss.shape}")
-            input("Press Enter to continue...")
+            # Compute loss for each sample in batch
+            total_loss = 0
+            for i in range(batch_size):
+                # Extract u and delta for this sample
+                sample_output = transformed_output[i] if batch_size > 1 else transformed_output
+                x0_sample = X_batch[i] if batch_size > 1 else X_batch
+                
+                # Reshape controls: (n_phases, n_inputs)
+                u_flat = sample_output[:network.n_phases * n_inputs]
+                u_list = [u_flat[j*n_inputs:(j+1)*n_inputs] for j in range(network.n_phases)]
+                
+                # Get deltas
+                delta_list = [sample_output[network.n_phases * n_inputs + j] for j in range(network.n_phases)]
+                
+                # Compute cost using the PyTorch cost function
+                # cost_func expects: (*u, *delta, x0)
+                args = u_list + delta_list + [x0_sample]
+                cost = network.cost_func(*args)
+                total_loss = total_loss + cost
+            
+            # Average loss over batch
+            loss = total_loss / batch_size
+            
+            # Backward pass - computes gradients w.r.t. all network parameters
+            network.zero_grad()
             loss.backward()
             
-            # Collect gradients
+            # Collect gradients from all parameters
             grads = []
             for param in network.parameters():
                 if param.grad is not None:
                     grads.append(param.grad.view(-1))
+                else:
+                    # Handle parameters without gradients (shouldn't happen normally)
+                    grads.append(torch.zeros_like(param.view(-1)))
     
-            pippo = torch.cat(grads)
-            print(f"Gradient shape: {pippo.shape}")
-            input("Press Enter to continue...")
-            return torch.cat(grads)
+            gradient = torch.cat(grads)
+            return gradient
         
         # Loss function
         def loss_func(params, data=None):
+            """Compute loss for given parameters."""
             network.set_flat_params(params)
             output = network(X_train)
             
-            if network.output_activation == 'softmax' and y_train.dtype == torch.long:
-                loss = criterion(output, y_train)
-            else:
-                loss = criterion(output, y_train)
+            # Apply transformation: T * softmax(output[-n_phases:]) for the deltas
+            T_tensor = torch.tensor(network.sys.time_horizon, device=output.device, dtype=output.dtype)
             
-            return loss
+            batch_size = X_train.shape[0]
+            n_control_outputs = network.n_phases * n_inputs
+            controls = output[:, :n_control_outputs]
+            delta_raw = output[:, n_control_outputs:]
+            
+            # Apply softmax and scale deltas
+            delta_normalized = F.softmax(delta_raw, dim=-1)
+            deltas = delta_normalized * T_tensor
+            
+            transformed_output = torch.cat([controls, deltas], dim=-1)
+            
+            # Compute loss for each sample in batch
+            total_loss = 0
+            for i in range(batch_size):
+                sample_output = transformed_output[i]
+                x0_sample = X_train[i]
+                
+                # Reshape controls
+                u_flat = sample_output[:network.n_phases * n_inputs]
+                u_list = [u_flat[j*n_inputs:(j+1)*n_inputs] for j in range(network.n_phases)]
+                
+                # Get deltas
+                delta_list = [sample_output[network.n_phases * n_inputs + j] for j in range(network.n_phases)]
+                
+                # Compute cost
+                args = u_list + delta_list + [x0_sample]
+                cost = network.cost_func(*args)
+                total_loss = total_loss + cost
+            
+            return (total_loss / batch_size).item()
         
         # Initial parameters
         params_init = network.get_flat_params()
@@ -353,17 +375,19 @@ if TORCH_AVAILABLE:
         # Set final parameters
         network.set_flat_params(params_optimized)
         
-        # Compute final accuracy
+        # Compute final loss
         if verbose:
             with torch.no_grad():
-                train_pred = network(X_train)
-                train_acc = compute_accuracy_torch(train_pred, y_train)
-                print(f"\nFinal Training Accuracy: {train_acc:.4f}")
+                final_loss = loss_func(params_optimized)
+                print(f"\nFinal Training Loss: {final_loss:.6f}")
                 
-                if X_val is not None and y_val is not None:
-                    val_pred = network(X_val)
-                    val_acc = compute_accuracy_torch(val_pred, y_val)
-                    print(f"Final Validation Accuracy: {val_acc:.4f}")
+                if X_val is not None:
+                    # Compute validation loss
+                    X_val_old = X_train
+                    X_train = X_val
+                    val_loss = loss_func(params_optimized)
+                    X_train = X_val_old
+                    print(f"Final Validation Loss: {val_loss:.6f}")
         
         return params_optimized, history
     
@@ -388,9 +412,9 @@ if TORCH_AVAILABLE:
 # ============================================================================
 
 
-def example_mnist_torch():
+def example_nahs_torch():
     """
-    Example: Train neural network on MNIST-like data using PyTorch optimizer.
+    Example: Train neural network on NAHS example using PyTorch optimizer.
     """
     if not TORCH_AVAILABLE:
         print("PyTorch not available. Skipping GPU example.")
@@ -402,21 +426,22 @@ def example_mnist_torch():
     
     # Generate synthetic data
     torch.manual_seed(42)
-    n_samples = 10000
-    n_features = 28 * 28
-    n_classes = 10
+    n_samples = 1000
+    n_phases = 50
+    n_control_inputs = 2
+    n_NN_inputs = 3
+    n_NN_outputs = n_phases * (n_control_inputs + 1)
     
-    X_train = torch.randn(n_samples, n_features)
-    y_train = torch.randint(0, n_classes, (n_samples,))
+    X_train = torch.empty(n_samples, n_NN_inputs).uniform_(-5.0, 5.0)
     
-    X_val = torch.randn(2000, n_features)
-    y_val = torch.randint(0, n_classes, (2000,))
+    X_val = torch.empty(200, n_NN_inputs).uniform_(-5.0, 5.0)
     
     # Create network
     network = SwiLinNN(
-        layer_sizes=[n_features, 128, 256, n_classes],
+        layer_sizes=[n_NN_inputs, 128, 256, n_NN_outputs],
+        n_phases=n_phases,
         activation='relu',
-        # output_activation='softmax'
+        output_activation='linear'
     )
     
     # Train
@@ -426,9 +451,9 @@ def example_mnist_torch():
     params_opt, history = train_neural_network(
         network=network,
         X_train=X_train,
-        y_train=y_train,
+        # y_train=None,
         X_val=X_val,
-        y_val=y_val,
+        # y_val=None,
         optimizer='sgd',
         learning_rate=0.001,
         n_epochs=100,
@@ -447,6 +472,6 @@ if __name__ == "__main__":
     
     # Run PyTorch example
     start = time.time()
-    example_mnist_torch()
+    example_nahs_torch()
     end = time.time()
     print(f"PyTorch example took {end - start:.2f} seconds")

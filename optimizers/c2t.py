@@ -304,13 +304,19 @@ def c2t(cusadi_folder="casadi_functions", output_dir=None, output_file="gen_file
             # Call generated low-level function (in-place on outputs/work)
             gen._{iname}(outputs, inputs_list, work)
 
-            # Return first output reshaped to original output matrix shape
-            out = outputs[0].reshape((B, {output_shape[0]}, {output_shape[1]}))
-            return out
+           
+            # Replace NaNs with zeros (non-in-place to preserve autograd graph)
+            out = torch.where(torch.isnan(outputs[0]), torch.tensor(0.0, device=device, dtype=dtype), outputs[0])ut
 
 
         if __name__ == '__main__':
-            # Quick smoke test (requires the user to provide sample inputs)
+            # Quick smoke test (requires the usero provout inputs)
+            total_nnz_in = sum(gen._cost_Nndn(1, total_nnz_in)
+            print(f"Running gen_file_torch.run_cost with random input of shape {{inputs.shape}}")
+            output = run_cost(inputs)
+            print("Output of run_cost:")
+            print(output)
+            print(f"Output shape: {{output.shape}}")
             print('Module {module_basename} wrapper for {iname} generated.')
         """)
 
