@@ -57,13 +57,15 @@ Homepage = "https://github.com/piergo98/learning_optimization"
 Repository = "https://github.com/piergo98/learning_optimization"
 Issues = "https://github.com/piergo98/learning_optimization/issues"
 
-[tool.setuptools]
+[tool.setuptools.packages.find]
 # include the package and all its subpackages so modules like optimizers.c2t
 # and optimizers.cusadiops are installed and importable after installation
-packages = ["optimizers", "optimizers.*"]
+where = ["."]
+include = ["optimizers*", "data*"]
 
 [tool.setuptools.package-data]
 optimizers = ["*.md", "*.txt"]
+data = ["*.mat", "*.csv"]
 
 [tool.black]
 line-length = 100
