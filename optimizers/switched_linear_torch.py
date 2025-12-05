@@ -522,7 +522,7 @@ class SwiLin:
             Ki = self.K[index]
         
         # Extract the S matrix of the previous iteration
-        S_prev = self.S[index - 1]
+        S_prev = self.S[index + 1]
         
         phi_i = self.transition_matrix(phi_a, phi_f)
         
@@ -609,7 +609,7 @@ class SwiLin:
                 else:
                     raise ValueError("The number of controls must be greater than 0.")
                 
-                return phi_t.T @ Q @ xr
+                return phi_t.T @ self.Q @ xr
         
         # Compute the integral of the S matrix
         if self.n_inputs == 0:
