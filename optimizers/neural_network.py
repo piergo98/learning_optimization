@@ -13,6 +13,7 @@ Features:
 import numpy as np
 import os, subprocess, sys
 import scipy.io
+from scipy.linalg import solve_continuous_are
 from typing import Optional, Callable, Tuple, Dict, List
 import warnings
 
@@ -26,7 +27,6 @@ except ImportError:
     warnings.warn("PyTorch not available. GPU training will not be available.")
     
 from switched_linear_torch import SwiLin
-from optimizers import gpu_optimize
 
 
 # ============================================================================
@@ -62,7 +62,7 @@ if TORCH_AVAILABLE:
             
             # Build switched linear problem
             self.n_phases = n_phases
-            self.sys, _ = self.switched_problem(self.n_phases)
+            self.sys = self.switched_problem(self.n_phases)
             
             self.layer_sizes = layer_sizes
             self.activation = activation
@@ -76,36 +76,14 @@ if TORCH_AVAILABLE:
         def switched_problem(self, n_phases: int):
             """Define switched linear problem."""
             model = {
-                'A': [
-                    np.array([[-2.5, 0.5, 0.3], [0.4, -2.0, 0.6], [0.2, 0.3, -1.8]]),
-                    np.array([[-1.9, 3.2, 0.4], [0.3, -2.1, 0.5], [0, 0.6, -2.3]]),
-                    np.array([[-2.2, 0, 0.5],   [0.2, -1.7, 0.4], [0.3, 0.2, -2.0]]),
-                    np.array([[-1.8, 0.3, 0.2], [0.5, -2.4, 0],   [0.4, 0, -2.2]]),
-                    np.array([[-2.0, 0.4, 0],   [0.3, -2.2, 0.2], [0.5, 0.3, -1.9]]),
-                    np.array([[-2.3, 0.2, 0.3], [0, -2.0, 0.4],   [0.2, 0.5, -2.1]]),
-                    np.array([[-1.7, 0.5, 0.4], [0.2, -2.5, 0.3], [1.1, 0.2, -2.4]]),
-                    np.array([[-2.1, 0.3, 0.2], [0.4, -1.9, 0.5], [0.3, 0.1, -2.0]]),
-                    np.array([[-2.4, 0, 0.5],   [0.2, -2.3, 0.3], [0.4, 0.2, -1.8]]),
-                    np.array([[-1.8, 0.4, 0.3], [0.5, -2.1, 0.2], [0.2, 3.1, -2.2]]),
-                ],
-                'B': [
-                    np.array([[1.5, 0.3], [0.4, 1.2], [0.2, 0.8]]),
-                    np.array([[1.2, 0.5], [0.3, 0.9], [0.4, 1.1]]),
-                    np.array([[1.0, 0.4], [0.5, 1.3], [0.3, 0.7]]),
-                    np.array([[1.4, 0.2], [0.6, 1.0], [0.1, 0.9]]),
-                    np.array([[1.3, 0.1], [0.2, 1.4], [0.5, 0.6]]),
-                    np.array([[1.1, 0.3], [0.4, 1.5], [0.2, 0.8]]),
-                    np.array([[1.6, 0.2], [0.3, 1.1], [0.4, 0.7]]),
-                    np.array([[1.0, 0.4], [0.5, 1.2], [0.3, 0.9]]),
-                    np.array([[1.2, 0.5], [0.1, 1.3], [0.6, 0.8]]),
-                    np.array([[1.4, 0.3], [0.2, 1.0], [0.5, 0.7]]),
-                ],
+                'A': [np.array([[-0.1, 0, 0], [0, -2, -6.25], [0, 4, 0]])],
+                'B': [np.array([[0.25], [2], [0]])],
             }
 
             n_states = model['A'][0].shape[0]
             n_inputs = model['B'][0].shape[1]
 
-            self.time_horizon = 2
+            self.time_horizon = 10.0
 
             x0 = np.array([2, -1, 5])
             
@@ -122,18 +100,19 @@ if TORCH_AVAILABLE:
             # Load model
             swi_lin.load_model(model)
 
-            Q = 10. * np.eye(n_states)
-            R = 10. * np.eye(n_inputs)
-            E = 1. * np.eye(n_states)
+            Q = 1. * np.eye(n_states)
+            R = 0.1 * np.eye(n_inputs)
+            # Solve the Algebraic Riccati Equation
+            P = np.array(solve_continuous_are(model['A'][0], model['B'][0], Q, R))
 
-            swi_lin.precompute_matrices(x0, Q, R, E)
+            swi_lin.load_weights(Q, R, P)
             x0_aug = np.append(x0, 1)  # augment with 1 for affine term
             
             # Store the cost function (now returns a callable)
-            self.cost_func = swi_lin.cost_function(R, sym_x0=True)
-            self.R = R
+            # self.cost_func = swi_lin.cost_function(R, sym_x0=True)
+            # self.R = R
             
-            return swi_lin, x0_aug
+            return swi_lin
         
         def forward(self, x):
             """Forward pass."""
@@ -173,6 +152,310 @@ if TORCH_AVAILABLE:
                 numel = param.numel()
                 param.data = flat_params[idx:idx + numel].view(param.shape)
                 idx += numel
+    
+    def evaluate_cost_functional(swi: SwiLin, u_all: torch.Tensor, delta_all: torch.Tensor, x0: torch.Tensor) -> torch.Tensor:
+        """
+        Pure functional evaluation of the LQR-style cost.
+        Args:
+        swi: SwiLin instance (used only for A,B,Q,R and helper functions)
+        u_all: tensor shape (n_phases, n_inputs)
+        delta_all: tensor shape (n_phases,) or (n_phases,1)
+        x0: tensor shape (n_states,) or (n_states,1)
+        Returns:
+        J: scalar tensor (dtype/device consistent with inputs)
+        """
+        device = u_all.device if torch.is_tensor(u_all) else swi.device
+        dtype = u_all.dtype if torch.is_tensor(u_all) else swi.dtype
+
+        n_ph = swi.n_phases
+        n_x = swi.n_states
+        n_u = swi.n_inputs
+
+        # ensure shapes
+        u_all = u_all.to(device=device, dtype=dtype)
+        delta_all = delta_all.view(n_ph).to(device=device, dtype=dtype)
+        x = x0.to(device=device, dtype=dtype).reshape(n_x, 1)  # column
+
+        # Local container for Ei, phi_f_i, Li, Mi, Ri, Hi if needed
+        Es = []
+        phi_fs = []
+        Lis = []
+        Mis = []
+        Ris = []
+
+        for i in range(n_ph):
+            u_i = u_all[i].reshape(-1) if n_u > 0 else None
+            delta_i = delta_all[i]
+
+            # mat_exp_prop returns different tuples depending on auto; adapt:
+            out = swi.mat_exp_prop(i, u_i, delta_i)
+            # for 'exp' non-autonomous our implementation returns (Ei, phi_f_i, Hi, Li, Mi, Ri)
+            if not swi.auto:
+                Ei, phi_f_i, Hi, Li, Mi, Ri = out
+                # phi_f_i returned as column vector (n_x x 1) in the file; ensure shape
+                phi_f_i = phi_f_i.reshape(n_x, 1)
+            else:
+                Ei, Li = out
+                phi_f_i = torch.zeros((n_x, 1), device=device, dtype=dtype)
+                Mi = torch.zeros((n_x, n_u), device=device, dtype=dtype) if n_u > 0 else None
+                Ri = torch.zeros((n_u, n_u), device=device, dtype=dtype) if n_u > 0 else None
+
+            Es.append(Ei)
+            phi_fs.append(phi_f_i)
+            Lis.append(Li)
+            Mis.append(Mi)
+            Ris.append(Ri)
+
+        # Backward pass to compute S_0 (local, no mutation):
+        # Terminal cost augmentation
+        Eterm = swi.E_term.to(device=device, dtype=dtype)
+        S_prev = 0.5 * torch.block_diag(Eterm, torch.zeros(1, 1, device=device, dtype=dtype))
+
+        for i in range(n_ph - 1, -1, -1):
+            Ei = Es[i]
+            phi_f_i = phi_fs[i]
+            Li = Lis[i]
+            Mi = Mis[i]
+            Ri = Ris[i]
+
+            # build S_int like in _S_matrix_exp
+            S_int = torch.zeros((n_x + 1, n_x + 1), device=device, dtype=dtype)
+            S_int[:n_x, :n_x] = Li
+            if n_u > 0:
+                ui_col = u_all[i].reshape(-1, 1)
+                Mi_ui = Mi @ ui_col
+                S_int[:n_x, n_x:] = Mi_ui
+                S_int[n_x:, :n_x] = Mi_ui.T
+                S_int[n_x:, n_x:] = ui_col.T @ Ri @ ui_col
+
+            # transition matrix phi (n_x+1 x n_x+1)
+            phi_i = swi.transition_matrix(Ei, phi_f_i)
+
+            S_curr = 0.5 * S_int + (phi_i.T @ S_prev @ phi_i)
+            S_prev = S_curr
+
+        S0 = S_prev  # S at time 0
+
+        # Forward propagate states locally (to compute state-dependent term)
+        x_curr = x
+        for i in range(n_ph):
+            Ei = Es[i]
+            phi_f_i = phi_fs[i]
+            if n_u > 0:
+                ui_col = u_all[i].reshape(-1, 1)
+                x_next = Ei @ x_curr + (phi_f_i)  # phi_f_i already includes multiplication by u in mat_exp_prop
+            else:
+                x_next = Ei @ x_curr
+            x_curr = x_next
+
+        x0_aug = torch.cat([x.reshape(-1, 1), torch.ones(1, 1, device=device, dtype=dtype)], dim=0)
+
+        # Control cost G
+        if n_u > 0:
+            # per-phase u^T R u * delta
+            G_terms = []
+            Rmat = swi.R.to(device=device, dtype=dtype)
+            for i in range(n_ph):
+                ui = u_all[i].reshape(-1, 1)
+                G_terms.append(0.5 * (ui.T @ Rmat @ ui) * delta_all[i])
+            G0 = sum(G_terms)
+        else:
+            G0 = torch.tensor(0.0, device=device, dtype=dtype)
+
+        J = 0.5 * (x0_aug.T @ S0 @ x0_aug) + G0
+        # Return scalar tensor
+        return J.squeeze()
+    
+    def evaluate_cost_functional_batch(
+        swi: SwiLin,
+        u_all_batch: torch.Tensor,
+        delta_all_batch: torch.Tensor,
+        x0_batch: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Vectorized evaluation of the LQR-style cost over a batch.
+
+        Args:
+            swi: SwiLin instance (used for model matrices and helpers)
+            u_all_batch: tensor shape (B, n_phases, n_inputs)
+            delta_all_batch: tensor shape (B, n_phases)
+            x0_batch: tensor shape (B, n_states)
+
+        Returns:
+            J_batch: tensor shape (B,) with per-sample costs
+        """
+        device = u_all_batch.device if torch.is_tensor(u_all_batch) else swi.device
+        dtype = u_all_batch.dtype if torch.is_tensor(u_all_batch) else swi.dtype
+
+        B = u_all_batch.shape[0]
+        n_ph = swi.n_phases
+        n_x = swi.n_states
+        n_u = swi.n_inputs
+
+        # Ensure tensors on correct device/dtype
+        u_all_batch = u_all_batch.to(device=device, dtype=dtype)
+        delta_all_batch = delta_all_batch.to(device=device, dtype=dtype).view(B, n_ph)
+        x0_batch = x0_batch.to(device=device, dtype=dtype).view(B, n_x)
+
+        # Containers per phase (each element will be batch-shaped)
+        Es = [None] * n_ph
+        phi_fs = [None] * n_ph
+        Lis = [None] * n_ph
+        Mis = [None] * n_ph
+        Ris = [None] * n_ph
+
+        # Useful constants
+        Q = swi.Q.to(dtype=dtype, device=device)
+        R = swi.R.to(dtype=dtype, device=device) if n_u > 0 else None
+        Eterm = swi.E_term.to(dtype=dtype, device=device)
+
+        # For each phase compute batched matrices
+        for i in range(n_ph):
+            A = swi.A[i].to(dtype=dtype, device=device)
+            Bmat = swi.B[i].to(dtype=dtype, device=device) if n_u > 0 else None
+
+            # Build big C matrix once (same across batch) as in _mat_exp_prop_exp
+            if not swi.auto:
+                m = n_u
+                Mdim = 3 * n_x + m
+                C_base = torch.zeros((Mdim, Mdim), dtype=dtype, device=device)
+                C_base[:n_x, :n_x] = -A.T
+                C_base[:n_x, n_x:2*n_x] = torch.eye(n_x, dtype=dtype, device=device)
+                C_base[n_x:2*n_x, n_x:2*n_x] = -A.T
+                C_base[n_x:2*n_x, 2*n_x:3*n_x] = Q
+                C_base[2*n_x:3*n_x, 2*n_x:3*n_x] = A
+                C_base[2*n_x:3*n_x, 3*n_x:] = Bmat
+
+                # Create batch of C scaled by delta
+                deltas_i = delta_all_batch[:, i].view(B, 1, 1)
+                C_batch = C_base.unsqueeze(0) * deltas_i
+
+                # Batched matrix exponential
+                exp_C = torch.linalg.matrix_exp(C_batch)
+
+                # Extract pieces
+                F3 = exp_C[:, 2*n_x:3*n_x, 2*n_x:3*n_x]  # (B, n_x, n_x)
+                G2 = exp_C[:, n_x:2*n_x, 2*n_x:3*n_x]  # (B, n_x, n_x)
+                G3 = exp_C[:, 2*n_x:3*n_x, 3*n_x:]      # (B, n_x, m)
+                H2 = exp_C[:, n_x:2*n_x, 3*n_x:]       # (B, n_x, m)
+                K1 = exp_C[:, :n_x, 3*n_x:]            # (B, n_x, m)
+
+                Ei_batch = F3
+                Li_batch = torch.matmul(F3.transpose(-1, -2), G2)
+
+                # phi_f_i = phi_f_i_ @ ui for each sample
+                ui_batch = u_all_batch[:, i, :].view(B, n_u, 1) if n_u > 0 else None
+                if n_u > 0:
+                    phi_f_i_ = G3  # (B, n_x, m)
+                    # phi_f: (B, n_x, 1)
+                    phi_f_batch = torch.matmul(phi_f_i_, ui_batch)
+
+                    # Mi = F3.T @ H2 -> (B, n_x, m)
+                    Mi_batch = torch.matmul(F3.transpose(-1, -2), H2)
+
+                    # Ri: temp = B.T @ F3.T @ K1  -> (B, m, m)
+                    # compute F3.T @ K1 -> (B, n_x, m)
+                    tmp = torch.matmul(F3.transpose(-1, -2), K1)
+                    # Bmat.T (m,n_x) @ tmp (B, n_x, m) -> (B, m, m)
+                    temp = torch.matmul(Bmat.T.unsqueeze(0), tmp)
+                    Ri_batch = temp + temp.transpose(-1, -2)
+                else:
+                    phi_f_batch = torch.zeros((B, n_x, 1), device=device, dtype=dtype)
+                    Mi_batch = torch.zeros((B, n_x, 0), device=device, dtype=dtype)
+                    Ri_batch = torch.zeros((B, 0, 0), device=device, dtype=dtype)
+
+                Es[i] = Ei_batch
+                phi_fs[i] = phi_f_batch
+                Lis[i] = Li_batch
+                Mis[i] = Mi_batch
+                Ris[i] = Ri_batch
+            else:
+                # Autonomous case: simpler (Ei depends only on delta)
+                deltas_i = delta_all_batch[:, i].view(B, 1, 1)
+                Ei_batch = torch.linalg.matrix_exp(A.unsqueeze(0) * deltas_i)
+                Li_batch = torch.zeros((B, n_x, n_x), device=device, dtype=dtype)
+                Es[i] = Ei_batch
+                phi_fs[i] = torch.zeros((B, n_x, 1), device=device, dtype=dtype)
+                Lis[i] = Li_batch
+                Mis[i] = torch.zeros((B, n_x, 0), device=device, dtype=dtype)
+                Ris[i] = torch.zeros((B, 0, 0), device=device, dtype=dtype)
+
+        # Backward recursion to compute S0 per sample
+        # Initialize S_prev as (B, n_x+1, n_x+1)
+        E_aug = torch.zeros((n_x+1, n_x+1), device=device, dtype=dtype)
+        E_aug[:n_x, :n_x] = Eterm
+        S_prev = 0.5 * E_aug.unsqueeze(0).expand(B, n_x+1, n_x+1).clone()
+
+        for i in range(n_ph-1, -1, -1):
+            Ei_b = Es[i]
+            phi_f_b = phi_fs[i]
+            Li_b = Lis[i]
+            Mi_b = Mis[i]
+            Ri_b = Ris[i]
+
+            # Build S_int batch
+            S_int = torch.zeros((B, n_x+1, n_x+1), device=device, dtype=dtype)
+            S_int[:, :n_x, :n_x] = Li_b
+
+            if n_u > 0:
+                ui_col = u_all_batch[:, i, :].view(B, n_u, 1)
+                # Mi_b: (B, n_x, n_u) -> Mi_ui: (B, n_x, 1)
+                Mi_ui = torch.matmul(Mi_b, ui_col)
+                S_int[:, :n_x, n_x:] = Mi_ui
+                S_int[:, n_x:, :n_x] = Mi_ui.transpose(-1, -2)
+                # scalar term: ui^T Ri ui -> (B,1,1)
+                tmp = torch.matmul(Ri_b, ui_col)  # (B, n_u, 1)
+                uiRiui = torch.matmul(ui_col.transpose(-1, -2), tmp)  # (B,1,1)
+                S_int[:, n_x:, n_x:] = uiRiui
+
+            # Build phi batch (B, n_x+1, n_x+1)
+            phi = torch.zeros((B, n_x+1, n_x+1), device=device, dtype=dtype)
+            phi[:, :n_x, :n_x] = Ei_b
+            phi[:, :n_x, n_x:n_x+1] = phi_f_b
+            phi[:, -1, -1] = 1.0
+
+            # S_curr = 0.5*S_int + phi^T * S_prev * phi
+            S_curr = 0.5 * S_int + torch.matmul(phi.transpose(-1, -2), torch.matmul(S_prev, phi))
+            S_prev = S_curr
+
+        S0_batch = S_prev
+
+        # Forward propagate states for each sample
+        x_curr = x0_batch.view(B, n_x, 1)
+        for i in range(n_ph):
+            Ei_b = Es[i]
+            phi_f_b = phi_fs[i]
+            if n_u > 0:
+                # Ei_b: (B,n_x,n_x), x_curr: (B,n_x,1) -> (B,n_x,1)
+                x_next = torch.matmul(Ei_b, x_curr) + phi_f_b
+            else:
+                x_next = torch.matmul(Ei_b, x_curr)
+            x_curr = x_next
+
+        # Augment x0 for bilinear form
+        x0_aug = torch.cat([x0_batch.view(B, n_x, 1), torch.ones((B, 1, 1), device=device, dtype=dtype)], dim=1)
+
+        # Compute quadratic term: 0.5 * x0_aug^T * S0 * x0_aug -> (B,1,1)
+        quad = torch.matmul(x0_aug.transpose(-1, -2), torch.matmul(S0_batch, x0_aug)).squeeze(-1).squeeze(-1)
+
+        # Compute G per sample
+        if n_u > 0:
+            # u_all_batch: (B, n_ph, n_u)
+            per_phase_terms = []
+            for i in range(n_ph):
+                u_b = u_all_batch[:, i, :]  # (B, n_u)
+                # (B, n_u) @ (n_u,n_u) -> (B, n_u)
+                uR = torch.matmul(u_b, R)
+                per = (uR * u_b).sum(dim=1)  # (B,)
+                per_phase_terms.append(0.5 * per * delta_all_batch[:, i])
+
+            G0 = torch.stack(per_phase_terms, dim=1).sum(dim=1)  # (B,)
+        else:
+            G0 = torch.zeros(B, device=device, dtype=dtype)
+
+        J_batch = 0.5 * quad + G0
+        return J_batch
+    
     
     
     def train_neural_network(
@@ -233,163 +516,120 @@ if TORCH_AVAILABLE:
         n_samples = X_train.shape[0]
         n_inputs = network.sys.n_inputs
         
-        # Gradient function
-        def gradient_func(params, indices=None, data=None):
-            """Compute gradient of loss w.r.t. network parameters."""
-            network.set_flat_params(params)
-            network.zero_grad()
+        # Initialize PyTorch optimizer
+        if optimizer.lower() == 'adam':
+            torch_optimizer = torch.optim.Adam(network.parameters(), lr=learning_rate)
+        elif optimizer.lower() == 'sgd':
+            torch_optimizer = torch.optim.SGD(network.parameters(), lr=learning_rate)
+        elif optimizer.lower() == 'rmsprop':
+            torch_optimizer = torch.optim.RMSprop(network.parameters(), lr=learning_rate)
+        else:
+            raise ValueError(f"Unknown optimizer '{optimizer}'. Supported: 'adam', 'sgd', 'rmsprop'")
+        
+        # Training history
+        history = {
+            'train_loss': [],
+            'val_loss': [] if X_val is not None else None,
+            'epochs': []
+        }
+        
+        # Training loop
+        for epoch in range(n_epochs):
+            epoch_loss = 0.0
+            n_batches = 0
             
-            if indices is not None:
-                X_batch = X_train[indices]
-            else:
-                X_batch = X_train
+            # Create random batches
+            indices = torch.randperm(n_samples, device=device)
             
-            batch_size = X_batch.shape[0]
-            output = network(X_batch)
-            
-            # Apply transformation: T * softmax(output[-n_phases:]) for the deltas
-            T_tensor = torch.tensor(network.sys.time_horizon, device=output.device, dtype=output.dtype)
+            for start_idx in range(0, n_samples, batch_size):
+                end_idx = min(start_idx + batch_size, n_samples)
+                batch_indices = indices[start_idx:end_idx]
+                
+                X_batch = X_train[batch_indices]
+                current_batch_size = X_batch.shape[0]
+                
+                # Zero gradients
+                torch_optimizer.zero_grad()
+                
+                # Forward pass
+                output = network(X_batch)
+                
+                # Apply transformation: T * softmax(output[-n_phases:]) for the deltas
+                T_tensor = torch.tensor(network.sys.time_horizon, device=output.device, dtype=output.dtype)
 
-            # Handle batch dimension properly
-            if output.dim() == 1:
-                # Single sample case
-                # Output format: [u_1_1, u_1_2, ..., u_n_1, u_n_2, ..., delta_1, ..., delta_n]
-                # Controls: first n_phases * n_inputs elements
-                # Deltas: last n_phases elements
+                # Handle batch dimension properly
                 n_control_outputs = network.n_phases * n_inputs
-                controls = output[:n_control_outputs]
-                delta_raw = output[n_control_outputs:]
-                
-                # Apply softmax and scale deltas
-                delta_normalized = F.softmax(delta_raw, dim=-1)
-                deltas = delta_normalized * T_tensor
-                
-                transformed_output = torch.cat([controls, deltas], dim=0)
-            else:
-                # Batch case
-                n_control_outputs = network.n_phases * n_inputs
-                controls = output[:, :n_control_outputs]
+                controls = output[:, :n_control_outputs] # shape (batch_size, n_phases * n_inputs)
                 delta_raw = output[:, n_control_outputs:]
                 
                 # Apply softmax and scale deltas
                 delta_normalized = F.softmax(delta_raw, dim=-1)
-                deltas = delta_normalized * T_tensor
+                deltas = delta_normalized * T_tensor # shape (batch_size, n_phases)
                 
-                transformed_output = torch.cat([controls, deltas], dim=-1)
-            
-            # Compute loss for each sample in batch
-            total_loss = 0
-            
-            for i in range(batch_size):
-                # Extract u and delta for this sample
-                sample_output = transformed_output[i] if batch_size > 1 else transformed_output
-                x0_sample = X_batch[i] if batch_size > 1 else X_batch
+                transformed_output = torch.cat([controls, deltas], dim=-1) # shape (batch_size, n_phases * (n_inputs + 1))
                 
-                # Reshape controls: (n_phases, n_inputs)
-                u_flat = sample_output[:network.n_phases * n_inputs]
-                u_list = [u_flat[j*n_inputs:(j+1)*n_inputs] for j in range(network.n_phases)]
+                # Instead of the for loop, I have to give the full batch to the cost function
+
+                # Vectorized batch loss computation
+                # reshape controls to (B, n_phases, n_inputs)
+                B_batch = current_batch_size
+                controls_reshaped = controls.view(B_batch, network.n_phases, n_inputs)
+                deltas_batch = deltas.view(B_batch, network.n_phases)
+                x0_batch = X_batch
+
+                J_batch = evaluate_cost_functional_batch(network.sys, controls_reshaped, deltas_batch, x0_batch)
+                loss = J_batch.mean()
                 
-                # Get deltas
-                delta_list = [sample_output[network.n_phases * n_inputs + j] for j in range(network.n_phases)]
+                # Backward pass
+                loss.backward()
                 
-                # Compute cost using the PyTorch cost function
-                # cost_func expects: (*u, *delta, x0)
-                args = u_list + delta_list + [x0_sample]
-                cost = network.cost_func(*args)
-                total_loss = total_loss + cost
-            
-            # Average loss over batch
-            loss = total_loss / batch_size
-            
-            # Backward pass - computes gradients w.r.t. all network parameters
-            network.zero_grad()
-            loss.backward()
-            
-            # Collect gradients from all parameters
-            grads = []
-            for param in network.parameters():
-                if param.grad is not None:
-                    grads.append(param.grad.view(-1))
-                else:
-                    # Handle parameters without gradients (shouldn't happen normally)
-                    grads.append(torch.zeros_like(param.view(-1)))
-    
-            gradient = torch.cat(grads)
-            return gradient
-        
-        # Loss function
-        def loss_func(params, data=None):
-            """Compute loss for given parameters."""
-            network.set_flat_params(params)
-            output = network(X_train)
-            
-            # Apply transformation: T * softmax(output[-n_phases:]) for the deltas
-            T_tensor = torch.tensor(network.sys.time_horizon, device=output.device, dtype=output.dtype)
-            
-            batch_size = X_train.shape[0]
-            n_control_outputs = network.n_phases * n_inputs
-            controls = output[:, :n_control_outputs]
-            delta_raw = output[:, n_control_outputs:]
-            
-            # Apply softmax and scale deltas
-            delta_normalized = F.softmax(delta_raw, dim=-1)
-            deltas = delta_normalized * T_tensor
-            
-            transformed_output = torch.cat([controls, deltas], dim=-1)
-            
-            # Compute loss for each sample in batch
-            total_loss = 0
-            for i in range(batch_size):
-                sample_output = transformed_output[i]
-                x0_sample = X_train[i]
+                # Optimizer step
+                torch_optimizer.step()
                 
-                # Reshape controls
-                u_flat = sample_output[:network.n_phases * n_inputs]
-                u_list = [u_flat[j*n_inputs:(j+1)*n_inputs] for j in range(network.n_phases)]
-                
-                # Get deltas
-                delta_list = [sample_output[network.n_phases * n_inputs + j] for j in range(network.n_phases)]
-                
-                # Compute cost
-                args = u_list + delta_list + [x0_sample]
-                cost = network.cost_func(*args)
-                total_loss = total_loss + cost
+                epoch_loss += loss.item()
+                n_batches += 1
             
-            return (total_loss / batch_size).item()
-        
-        # Initial parameters
-        params_init = network.get_flat_params()
-        
-        # Train
-        params_optimized, history = gpu_optimize(
-            params_init=params_init,
-            gradient_func=gradient_func,
-            loss_func=loss_func,
-            optimizer=optimizer,
-            learning_rate=learning_rate,
-            n_epochs=n_epochs,
-            batch_size=batch_size,
-            n_samples=n_samples,
-            device=device,
-            verbose=verbose
-        )
-        
-        # Set final parameters
-        network.set_flat_params(params_optimized)
-        
-        # Compute final loss
-        if verbose:
-            with torch.no_grad():
-                final_loss = loss_func(params_optimized)
-                print(f"\nFinal Training Loss: {final_loss:.6f}")
-                
+            # Average loss for the epoch
+            avg_train_loss = epoch_loss / n_batches
+            history['train_loss'].append(avg_train_loss)
+            history['epochs'].append(epoch)
+            
+            # Validation loss
+            if X_val is not None:
+                with torch.no_grad():
+                    val_output = network(X_val)
+                    
+                    # Transform validation output
+                    n_control_outputs = network.n_phases * n_inputs
+                    val_controls = val_output[:, :n_control_outputs]
+                    val_delta_raw = val_output[:, n_control_outputs:]
+                    val_delta_normalized = F.softmax(val_delta_raw, dim=-1)
+                    val_deltas = val_delta_normalized * T_tensor
+                    val_transformed = torch.cat([val_controls, val_deltas], dim=-1)
+                    
+                    # Vectorized validation loss
+                    Bv = X_val.shape[0]
+                    val_controls = val_controls.view(Bv, network.n_phases, n_inputs)
+                    val_deltas = val_deltas.view(Bv, network.n_phases)
+                    J_val = evaluate_cost_functional_batch(network.sys, val_controls, val_deltas, X_val)
+                    avg_val_loss = J_val.mean().item()
+                    history['val_loss'].append(avg_val_loss)
+            
+            # Print progress
+            if verbose and (epoch + 1) % max(1, n_epochs // 10) == 0:
                 if X_val is not None:
-                    # Compute validation loss
-                    X_val_old = X_train
-                    X_train = X_val
-                    val_loss = loss_func(params_optimized)
-                    X_train = X_val_old
-                    print(f"Final Validation Loss: {val_loss:.6f}")
+                    print(f"Epoch {epoch + 1}/{n_epochs} - Train Loss: {avg_train_loss:.6f} - Val Loss: {avg_val_loss:.6f}")
+                else:
+                    print(f"Epoch {epoch + 1}/{n_epochs} - Train Loss: {avg_train_loss:.6f}")
+        
+        # Get final parameters
+        params_optimized = network.get_flat_params()
+        
+        # Print final losses
+        if verbose:
+            print(f"\nFinal Training Loss: {history['train_loss'][-1]:.6f}")
+            if X_val is not None and history['val_loss']:
+                print(f"Final Validation Loss: {history['val_loss'][-1]:.6f}")
         
         return params_optimized, history
     
@@ -414,7 +654,7 @@ if TORCH_AVAILABLE:
 # ============================================================================
 
 
-def example_nahs_torch():
+def example_pannocchia_torch():
     """
     Example: Train neural network on NAHS example using PyTorch optimizer.
     """
@@ -429,8 +669,8 @@ def example_nahs_torch():
     # Generate synthetic data
     torch.manual_seed(42)
     n_samples = 1000
-    n_phases = 50
-    n_control_inputs = 2
+    n_phases = 80
+    n_control_inputs = 1
     n_NN_inputs = 3
     n_NN_outputs = n_phases * (n_control_inputs + 1)
     
@@ -504,11 +744,11 @@ if __name__ == "__main__":
     import time
     
     # print("\n" + "=" * 70 + "\n")
-    data_file = 'example_1_paper_NAHS.mat'
-    data = load_data(data_file)
+    # data_file = 'optimal_params.mat'
+    # data = load_data(data_file)
     
     # Run PyTorch example
     start = time.time()
-    example_nahs_torch()
+    example_pannocchia_torch()
     end = time.time()
     print(f"PyTorch example took {end - start:.2f} seconds")

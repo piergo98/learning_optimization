@@ -20,7 +20,7 @@ from scipy.linalg import block_diag
 class SwiLin:
     def __init__(
         self,
-        n_phases, 
+        n_phases,
         n_states, 
         n_inputs, 
         time_horizon, 
@@ -74,7 +74,7 @@ class SwiLin:
         self.device = torch.device(device)
         
         # Default dtype (will be updated based on input data)
-        self.dtype = torch.float64
+        self.dtype = torch.float32
         
         # Define the system's state variables as a tensor of shape (n_phases+1, n_states)
         self.x = torch.zeros(self.n_phases + 1, self.n_states, dtype=self.dtype, device=self.device) 
@@ -540,8 +540,12 @@ class SwiLin:
             S = S_int + (phi_i.T @ S_prev @ phi_i)
             return S
         
+        phi = phi_i.clone()
+        S_prev_used = S_prev.clone()
+        S_int_used = S_int.clone()
+        
         # Compute S matrix
-        S = 0.5 * S_int + (phi_i.T @ S_prev @ phi_i)
+        S = 0.5 * S_int_used + (phi.T @ S_prev_used @ phi)
         
         return S
     
@@ -783,9 +787,23 @@ class SwiLin:
         x0          (torch.Tensor): The initial state.
         
         Returns:
-        callable: A function that takes (*u_list, *delta_list, x0) and returns the cost J.
+        J           (torch.Tensor): The total cost.
         """
-       
+        # Check if u_all and delta_all are provided and are tensors on the same device
+        if u_all is not None:
+            if not torch.is_tensor(u_all):
+                u_all = torch.stack([
+                    torch.tensor(ui, dtype=self.dtype, device=self.device) if not torch.is_tensor(ui)
+                    else ui.to(dtype=self.dtype, device=self.device)
+                    for ui in u_all
+                ])
+            else:
+                u_all = u_all.to(dtype=self.dtype, device=self.device)
+        if delta_all is not None:
+            if not torch.is_tensor(delta_all):
+                delta_all = torch.tensor(delta_all, dtype=self.dtype, device=self.device)
+            else:
+                delta_all = delta_all.to(dtype=self.dtype, device=self.device)
         # Ensure x0 is a tensor
         if not isinstance(x0, torch.Tensor):
             x0_tensor = torch.tensor(x0, dtype=self.dtype, device=self.device)
