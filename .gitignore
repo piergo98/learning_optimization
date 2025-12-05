@@ -9,6 +9,9 @@
 # Images folder
 images/
 
+# Logs
+logs/
+
 # Figures files in all subdirectories
 **/*.eps
 **/*.pdf

@@ -16,6 +16,7 @@ import scipy.io
 from scipy.linalg import solve_continuous_are
 from typing import Optional, Callable, Tuple, Dict, List
 import warnings
+import json
 
 try:
     import torch
@@ -34,6 +35,7 @@ from switched_linear_torch import SwiLin
 # ============================================================================
 
 if TORCH_AVAILABLE:
+    from torch.utils.tensorboard import SummaryWriter
     
     class SwiLinNN(nn.Module):
         """
@@ -152,6 +154,27 @@ if TORCH_AVAILABLE:
                 numel = param.numel()
                 param.data = flat_params[idx:idx + numel].view(param.shape)
                 idx += numel
+
+        def save(self, path: str) -> None:
+            """Save the network parameters (state_dict) to `path`.
+
+            Args:
+                path: filesystem path where to save the state_dict (e.g. 'model.pt').
+            """
+            # Ensure parent directory exists
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            torch.save(self.state_dict(), path)
+
+        def load(self, path: str, map_location: Optional[str] = None) -> None:
+            """Load the network parameters from `path` into this model.
+
+            Args:
+                path: filesystem path from which to load the state_dict.
+                map_location: optional torch.load map_location argument.
+            """
+            map_loc = map_location if map_location is not None else None
+            state = torch.load(path, map_location=map_loc)
+            self.load_state_dict(state)
     
     def evaluate_cost_functional(swi: SwiLin, u_all: torch.Tensor, delta_all: torch.Tensor, x0: torch.Tensor) -> torch.Tensor:
         """
@@ -469,7 +492,13 @@ if TORCH_AVAILABLE:
         n_epochs: int = 100,
         batch_size: int = 32,
         device: str = 'cpu',
-        verbose: bool = True
+        verbose: bool = True,
+        tensorboard_logdir: Optional[str] = None,
+        log_histograms: bool = False,
+        save_history: bool = False,
+        save_history_path: Optional[str] = None,
+        save_model: bool = False,
+        save_model_path: Optional[str] = None,
     ) -> Tuple[torch.Tensor, Dict]:
         """
         Train neural network using PyTorch GPU optimizers.
@@ -533,6 +562,18 @@ if TORCH_AVAILABLE:
             'epochs': []
         }
         
+        # Setup TensorBoard writer if requested
+        writer = SummaryWriter(log_dir=tensorboard_logdir) if tensorboard_logdir is not None else None
+
+        # Determine history save path
+        if save_history:
+            if save_history_path is None:
+                if tensorboard_logdir is not None:
+                    save_history_path = os.path.join(tensorboard_logdir, 'history.json')
+                else:
+                    save_history_path = os.path.join(os.getcwd(), 'training_history.json')
+
+
         # Training loop
         for epoch in range(n_epochs):
             epoch_loss = 0.0
@@ -582,9 +623,24 @@ if TORCH_AVAILABLE:
                 
                 # Backward pass
                 loss.backward()
-                
+                # Compute gradient norm for logging
+                grad_norm = None
+                if writer is not None:
+                    tot = torch.tensor(0.0, device=device)
+                    for p in network.parameters():
+                        if p.grad is not None:
+                            tot = tot + p.grad.detach().to(device).pow(2).sum()
+                    grad_norm = torch.sqrt(tot).item()
+
                 # Optimizer step
                 torch_optimizer.step()
+
+                # Log per-batch stats to TensorBoard (optional)
+                if writer is not None:
+                    global_step = epoch * max(1, n_samples // batch_size) + n_batches
+                    writer.add_scalar('train/batch_loss', loss.item(), global_step)
+                    if grad_norm is not None:
+                        writer.add_scalar('train/batch_grad_norm', grad_norm, global_step)
                 
                 epoch_loss += loss.item()
                 n_batches += 1
@@ -614,6 +670,35 @@ if TORCH_AVAILABLE:
                     J_val = evaluate_cost_functional_batch(network.sys, val_controls, val_deltas, X_val)
                     avg_val_loss = J_val.mean().item()
                     history['val_loss'].append(avg_val_loss)
+
+            # Write epoch-level scalars to TensorBoard
+            if writer is not None:
+                writer.add_scalar('train/epoch_loss', avg_train_loss, epoch)
+                if X_val is not None:
+                    writer.add_scalar('val/epoch_loss', avg_val_loss, epoch)
+                # Optionally log parameter histograms once per epoch
+                if log_histograms:
+                    for name, param in network.named_parameters():
+                        writer.add_histogram(f'params/{name}', param.detach().cpu().numpy(), epoch)
+
+            # Save history to disk each epoch if requested
+            if save_history:
+                try:
+                    serial = {}
+                    for k, v in history.items():
+                        if v is None:
+                            serial[k] = None
+                        elif isinstance(v, list):
+                            serial[k] = [float(x) for x in v]
+                        else:
+                            serial[k] = v
+                    # Ensure directory exists
+                    os.makedirs(os.path.dirname(save_history_path), exist_ok=True)
+                    with open(save_history_path, 'w') as fh:
+                        json.dump(serial, fh, indent=2)
+                except Exception:
+                    # Don't interrupt training on save failure; warn instead
+                    warnings.warn(f"Failed to save training history to {save_history_path}")
             
             # Print progress
             if verbose and (epoch + 1) % max(1, n_epochs // 10) == 0:
@@ -625,12 +710,26 @@ if TORCH_AVAILABLE:
         # Get final parameters
         params_optimized = network.get_flat_params()
         
+        # Optionally save the trained model parameters
+        if save_model:
+            if save_model_path is None:
+                if tensorboard_logdir is not None:
+                    save_model_path = os.path.join(tensorboard_logdir, 'model_state_dict.pt')
+                else:
+                    save_model_path = os.path.join(os.getcwd(), 'model_state_dict.pt')
+            try:
+                network.save(save_model_path)
+                if verbose:
+                    print(f"Saved model state_dict to: {save_model_path}")
+            except Exception:
+                warnings.warn(f"Failed to save model to {save_model_path}")
+
         # Print final losses
         if verbose:
             print(f"\nFinal Training Loss: {history['train_loss'][-1]:.6f}")
             if X_val is not None and history['val_loss']:
                 print(f"Final Validation Loss: {history['val_loss'][-1]:.6f}")
-        
+
         return params_optimized, history
     
     
@@ -668,7 +767,7 @@ def example_pannocchia_torch():
     
     # Generate synthetic data
     torch.manual_seed(42)
-    n_samples = 1000
+    n_samples = 10000
     n_phases = 80
     n_control_inputs = 1
     n_NN_inputs = 3
@@ -690,6 +789,11 @@ def example_pannocchia_torch():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Using device: {device}")
     
+    # Store the path where the script is located
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    date = subprocess.check_output(['date', '+%Y%m%d_%H%M%S']).decode('utf-8').strip()
+    tensorboard_logdir = os.path.join(script_dir, "..", "logs", date)
+    
     params_opt, history = train_neural_network(
         network=network,
         X_train=X_train,
@@ -698,10 +802,13 @@ def example_pannocchia_torch():
         # y_val=None,
         optimizer='adam',
         learning_rate=0.001,
-        n_epochs=100,
-        batch_size=1000,
+        n_epochs=200,
+        batch_size=10000,
         device=device,
-        verbose=True
+        verbose=True,
+        tensorboard_logdir=tensorboard_logdir,
+        log_histograms=False,
+        
     )
     
     print("\nTraining complete!")
