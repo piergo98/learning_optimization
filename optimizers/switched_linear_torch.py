@@ -8,6 +8,7 @@ from numbers import Number
 
 import torch
 import torch.nn as nn
+from typing import List, Tuple, Dict, Optional
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -17,7 +18,17 @@ from scipy.linalg import block_diag
 
 
 class SwiLin:
-    def __init__(self, n_phases, n_states, n_inputs, time_horizon, auto=False, propagation='exp', plot="display", device='cpu') -> None:
+    def __init__(
+        self,
+        n_phases, 
+        n_states, 
+        n_inputs, 
+        time_horizon, 
+        auto=False, 
+        propagation='exp', 
+        plot="display", 
+        device='cuda'
+    ) -> None:
         """
         Set up the SwiLin class
         
@@ -63,35 +74,30 @@ class SwiLin:
         self.device = torch.device(device)
         
         # Default dtype (will be updated based on input data)
-        self.dtype = torch.float32
+        self.dtype = torch.float64
         
-        # Define the system's variables
-        self.x = []
-        # Control input defined as a list of tensors
-        self.u = []
-        if self.auto:
-            self.n_inputs = 0
-        
-        # Initialize the matrices
-        self.E = []
-        self.phi_f = []
-        self.autonomous_evol = []
-        self.forced_evol = []
-        self.evol = []
-        self.H = []
-        self.J = []
-        self.L = []
-        self.M = []
-        self.R = []
-        self.S = []
+        # Define the system's state variables as a tensor of shape (n_phases+1, n_states)
+        self.x = torch.zeros(self.n_phases + 1, self.n_states, dtype=self.dtype, device=self.device) 
+        # Control input defined as a tensor of shape (n_phases, n_inputs)
+        if not self.auto:
+            self.n_inputs = n_inputs
+            self.phi_f = torch.zeros(self.n_phases, self.n_states, self.n_inputs, dtype=self.dtype, device=self.device)
+            self.H = torch.zeros(self.n_phases, self.n_inputs, self.n_states + 1, self.n_states + 1, dtype=self.dtype, device=self.device)
+            self.M = torch.zeros(self.n_phases, self.n_states, self.n_inputs, dtype=self.dtype, device=self.device)
+            self.K = torch.zeros(self.n_phases, self.n_inputs, self.n_inputs, dtype=self.dtype, device=self.device)
+        else:
+            self.n_inputs = 0   
+            
+        # Initialize the matrices as 3D tensors of shapes (n_phases, whatever, whatever)
+        self.E = torch.zeros(self.n_phases, self.n_states, self.n_states, dtype=self.dtype, device=self.device)
+        self.L = torch.zeros(self.n_phases, self.n_states, self.n_states, dtype=self.dtype, device=self.device)
+        self.S = torch.zeros(self.n_phases + 1, self.n_states + 1, self.n_states + 1, dtype=self.dtype, device=self.device)
         self.Sr = []
-        self.C = []
-        self.N = []
-        self.D = []
-        self.G = []
-        self.x_opt = []
-        self.S_num = []
-        self.S_int = []
+        # self.C = []
+        # self.N = []
+        # self.D = []
+        # self.G = []
+        self.T = torch.zeros(self.n_phases, self.n_states + 1, self.n_states + 1, dtype=self.dtype, device=self.device)
         self.Sr_int = []
     
     def load_model(self, model) -> None:
@@ -118,7 +124,34 @@ class SwiLin:
         
         # Define the number of modes of the system
         self.n_modes = len(A)
+    
+    def load_weights(self, Q, R, E) -> None:
+        """
+        Load the weight matrices
         
+        Args:
+            Q   (torch.Tensor or np.ndarray): The weight matrix for the state.
+            R   (torch.Tensor or np.ndarray): The weight matrix for the control.
+            E   (torch.Tensor or np.ndarray): The weight matrix for the terminal state.
+        """
+        
+        # Convert numpy arrays to torch tensors
+        # Convert Q to tensor if it's numpy and augment by 1 (add zero row/col)
+        if isinstance(Q, np.ndarray):
+            self.Q = torch.tensor(Q, dtype=self.dtype, device=self.device)
+        else:
+            self.Q = Q.to(dtype=self.dtype, device=self.device)
+        
+        if isinstance(R, np.ndarray):
+            self.R = torch.tensor(R, dtype=self.dtype, device=self.device)
+        else:
+            self.R = R.to(dtype=self.dtype, device=self.device)
+        
+        if isinstance(E, np.ndarray):
+            self.E_term = torch.tensor(E, dtype=self.dtype, device=self.device)
+        else:
+            self.E_term = E.to(dtype=self.dtype, device=self.device)
+
     def integrator(self, func, t0, tf, *args):
         """
         Integrates f(t) between t0 and tf using the given function func using the composite Simpson's 1/3 rule.
@@ -204,8 +237,7 @@ class SwiLin:
         """        
         
         n = A.shape[0]  # Size of matrix A
-        result = torch.eye(n, dtype=self.dtype, device=self.device)   # Initialize result to identity matrix
-        
+                
         # Number of terms for the Taylor series expansion
         # num_terms = self._get_n_terms_expm_approximation()
         
@@ -238,14 +270,14 @@ class SwiLin:
             
         return n_terms_max
     
-    def _mat_exp_prop_exp(self, index, Q, R):
+    def _mat_exp_prop_exp(self, index, u_i, delta_i):
         """
         Compute matrix exponential properties.
 
         Args:
         index   (int): The index of the mode.
-        Q       (torch.Tensor): Weight matrix
-        R       (torch.Tensor): Weight matrix
+        u_i     (torch.Tensor): The control input for the i-th mode.
+        delta_i (torch.Tensor): The phase duration for the i-th mode.
 
         Returns:
         Ei      (torch.Tensor): The matrix exponential of Ai*delta_i.
@@ -260,9 +292,6 @@ class SwiLin:
         A = self.A[index]
         B = self.B[index]
         
-        # Extract the phase duration (will be a parameter)
-        delta_i = self.delta[index]
-        
         # Create a big matrix of dimensions (3n+m)x(3n+m) 
         C = torch.zeros((3*self.n_states + self.n_inputs, 3*self.n_states + self.n_inputs), 
                         dtype=self.dtype, device=self.device)
@@ -270,9 +299,10 @@ class SwiLin:
         C[:self.n_states, :self.n_states] = -A.T
         C[:self.n_states, self.n_states:2*self.n_states] = torch.eye(self.n_states, dtype=self.dtype, device=self.device)
         C[self.n_states:2*self.n_states, self.n_states:2*self.n_states] = -A.T
-        C[self.n_states:2*self.n_states, 2*self.n_states:3*self.n_states] = Q
+        C[self.n_states:2*self.n_states, 2*self.n_states:3*self.n_states] = self.Q
         C[2*self.n_states:3*self.n_states, 2*self.n_states:3*self.n_states] = A
-        C[2*self.n_states:3*self.n_states, 3*self.n_states:] = B
+        if not self.auto:
+            C[2*self.n_states:3*self.n_states, 3*self.n_states:] = B
         
         # Compute matrix exponential
         exp_C = self.expm(C, delta_i)
@@ -280,22 +310,21 @@ class SwiLin:
         # Extract the instrumental matrices from the matrix exponential
         F3 = exp_C[2*self.n_states:3*self.n_states, 2*self.n_states:3*self.n_states]
         G2 = exp_C[self.n_states:2*self.n_states, 2*self.n_states:3*self.n_states]
-        G3 = exp_C[2*self.n_states:3*self.n_states, 3*self.n_states:]
-        H2 = exp_C[self.n_states:2*self.n_states, 3*self.n_states:]
-        K1 = exp_C[:self.n_states, 3*self.n_states:]
-        
         Ei = F3
         Li = F3.T @ G2        
         
         # Distinct case for autonomous systems
         # Extract the control input
-        if self.n_inputs > 0:
-            ui = self.u[index]
-        
+        if not self.auto:
+            G3 = exp_C[2*self.n_states:3*self.n_states, 3*self.n_states:]
+            H2 = exp_C[self.n_states:2*self.n_states, 3*self.n_states:]
+            K1 = exp_C[:self.n_states, 3*self.n_states:]
+            
             phi_f_i_ = G3
             
-            phi_f_i = phi_f_i_ @ ui
-
+            ui_col = u_i.reshape(-1, 1) if u_i.dim() == 1 else u_i
+            phi_f_i = phi_f_i_ @ ui_col
+            
             Mi = F3.T @ H2
             
             Ri = (B.T @ F3.T @ K1) + (B.T @ F3.T @ K1).T
@@ -304,14 +333,13 @@ class SwiLin:
             Hi = []
             
             # Fill the Hk matrix with the k-th column of phi_f_i_ (integral term)
-            for k in range(ui.shape[0]):
-                Hk = torch.zeros(self.n_states + 1, self.n_states + 1, dtype=torch.float32, device=self.device)
-                Hk[:self.n_states, self.n_states] = phi_f_i_[:, k]
-                Hi.append(Hk)
+            Hi = torch.zeros(self.n_inputs, self.n_states + 1, self.n_states + 1, dtype=self.dtype, device=self.device)
+            for k in range(self.n_inputs):
+                Hi[k, :self.n_states, self.n_states] = phi_f_i_[:, k]
         
             return Ei, phi_f_i, Hi, Li, Mi, Ri
         else:
-            return Ei, torch.zeros(0, device=self.device), torch.zeros(0, device=self.device), Li, torch.zeros(0, device=self.device), torch.zeros(0, device=self.device)
+            return Ei, Li
         
     def _mat_exp_prop_int(self, index):
         """
@@ -359,7 +387,7 @@ class SwiLin:
         else:
             return Ei, torch.zeros(0, device=self.device), 0, torch.zeros(0, device=self.device), torch.zeros(0, device=self.device), torch.zeros(0, device=self.device)
         
-    def mat_exp_prop(self, index, Q, R):
+    def mat_exp_prop(self, index, u_i, delta_i):
         """
         Compute matrix exponential properties.
 
@@ -378,17 +406,21 @@ class SwiLin:
         
         """        
         if self.propagation == 'exp':
-            return self._mat_exp_prop_exp(index, Q, R)
+            return self._mat_exp_prop_exp(index, u_i, delta_i)
         else:
             return self._mat_exp_prop_int(index)
         
     def _propagate_state(self, x0):
-        self.x = [x0]
+        """
+        Forward propagate the states through all phases.
+        """
+        # Set initial state
+        self.x[0] = x0
         for i in range(self.n_phases):
-            if self.n_inputs > 0:
-                self.x.append(self.E[i] @ self.x[i] + self.phi_f[i])
+            if not self.auto:
+                self.x[i+1] = self.E[i] @ self.x[i] + self.phi_f[i].squeeze(-1)
             else:
-                self.x.append(self.E[i] @ self.x[i])
+                self.x[i+1] = self.E[i] @ self.x[i]
         
     def transition_matrix(self, phi_a, phi_f):
         """
@@ -402,12 +434,12 @@ class SwiLin:
         phi (torch.Tensor): The transition matrix.
         
         """
-        phi = torch.zeros(self.n_states+1, self.n_states+1, dtype=torch.float32, device=self.device)
+        phi = torch.zeros(self.n_states+1, self.n_states+1, dtype=self.dtype, device=self.device)
         
         # Distinct case for autonomous and non-autonomous systems
-        if self.n_inputs > 0:
+        if not self.auto:
             phi[:self.n_states, :self.n_states] = phi_a
-            phi[:self.n_states, self.n_states] = phi_f
+            phi[:self.n_states, self.n_states:self.n_states+1] = phi_f
             phi[-1, -1] = 1
         else:
             phi[:self.n_states, :self.n_states] = phi_a
@@ -458,7 +490,7 @@ class SwiLin:
         
         return D
     
-    def _S_matrix_exp(self, index, xr=None):
+    def _S_matrix_exp(self, index, u_i, delta_i, xr=None):
         """
         Computes the S matrix for the given index.
         If a reference state is given, it computes the Sr matrix in order to minimize the error
@@ -466,6 +498,8 @@ class SwiLin:
         
         Args:
         index   (int):          The index of the mode.
+        u_i     (torch.Tensor): The control input for the mode.
+        delta_i (torch.Tensor): The phase duration for the mode.
         xr      (torch.Tensor): The reference state.
         
         Returns:
@@ -476,30 +510,30 @@ class SwiLin:
         """
         # Extract the autonomous and non-autonomous parts of the state
         phi_a = self.E[index]
-        phi_f = self.phi_f[index]
-        
-        # Extract the input (if present)
-        if self.n_inputs > 0:
-            ui = self.u[index]
-        
+        if not self.auto:
+            phi_f = self.phi_f[index]
+        else:
+            phi_f = None
+                
         # Extract the matrices for the integral term
         Li = self.L[index]
-        Mi = self.M[index]
-        Ri = self.R[index]
+        if not self.auto:
+            Mi = self.M[index]
+            Ki = self.K[index]
         
         # Extract the S matrix of the previous iteration
-        S_prev = self.S[0]
+        S_prev = self.S[index - 1]
         
         phi_i = self.transition_matrix(phi_a, phi_f)
         
-        S_int = torch.zeros(self.n_states + 1, self.n_states + 1, dtype=torch.float32, device=self.device)
+        S_int = torch.zeros(self.n_states + 1, self.n_states + 1, dtype=self.dtype, device=self.device)
         S_int[:self.n_states, :self.n_states] = Li
-        if self.n_inputs > 0:
-            ui_col = ui.reshape(-1, 1) if ui.dim() == 1 else ui
+        if not self.auto:
+            ui_col = u_i.reshape(-1, 1) if u_i.dim() == 1 else u_i
             Mi_ui = Mi @ ui_col
             S_int[:self.n_states, self.n_states:] = Mi_ui
             S_int[self.n_states:, :self.n_states] = Mi_ui.T
-            S_int[self.n_states:, self.n_states:] = ui_col.T @ Ri @ ui_col
+            S_int[self.n_states:, self.n_states:] = ui_col.T @ Ki @ ui_col
         
         # If a reference state is given, compute both the Sr matrix and the S matrix
         if xr is not None:
@@ -507,11 +541,11 @@ class SwiLin:
             return S
         
         # Compute S matrix
-        S = S_int + (phi_i.T @ S_prev @ phi_i)
+        S = 0.5 * S_int + (phi_i.T @ S_prev @ phi_i)
         
         return S
     
-    def _S_matrix_int(self, index, Q, xr=None):
+    def _S_matrix_int(self, index, xr=None):
         """
         Computes the S matrix for the given index.
         If a reference state is given, it computes the Sr matrix in order to minimize the error
@@ -560,7 +594,7 @@ class SwiLin:
             else:
                 raise ValueError("The number of controls must be greater than 0.")
             
-            return phi_t.T @ Q @ phi_t
+            return phi_t.T @ self.Q @ phi_t
         
         if xr is not None:
             # Integral term that updates the Sr matrix
@@ -602,7 +636,7 @@ class SwiLin:
         
         return S    
     
-    def S_matrix(self, index, Q, xr=None):
+    def S_matrix(self, index, u_i, delta_i, xr=None):
         """
         Computes the S matrix for the given index.
         If a reference state is given, it computes the Sr matrix in order to minimize the error
@@ -610,7 +644,8 @@ class SwiLin:
         
         Args:
         index   (int):          The index of the mode.
-        Q       (torch.Tensor): The weight matrix.
+        u_i     (torch.Tensor): The control input for the mode.
+        delta_i (torch.Tensor): The phase duration for the mode.
         xr      (torch.Tensor): The reference state.
         
         Returns:
@@ -620,9 +655,9 @@ class SwiLin:
         
         """
         if self.propagation == 'exp':
-            return self._S_matrix_exp(index, xr)
+            return self._S_matrix_exp(index, u_i, delta_i, xr)
         else:
-            return self._S_matrix_int(index, Q, xr)
+            return self._S_matrix_int(index, u_i, delta_i, xr)
         
     def C_matrix(self, index, Q):
         """
@@ -684,12 +719,13 @@ class SwiLin:
         
         return N
         
-    def G_matrix(self, R):
+    def compute_G(self, u, delta):
         """
         Computes the G matrix.
         
         Args:
-        R (torch.Tensor): The weight matrix.
+        u       (torch.Tensor): The control inputs.
+        delta   (torch.Tensor): The phase durations.
         
         Returns:
         G (torch.Tensor): The G matrix.
@@ -697,104 +733,87 @@ class SwiLin:
         """
         
         G = 0
-        for i in range(self.n_phases):
-            ui = self.u[i]
-            ui_col = ui.reshape(-1, 1) if ui.dim() == 1 else ui
-            pippo = 0.5 * (ui_col.T @ R @ ui_col) * self.delta[i]
-            G = G + pippo
+        # Fast vectorized computation of G = 0.5 * sum_i delta[i] * u[i]^T R u[i]
+        if self.n_inputs == 0:
+            return G
+
+        # Convert u to tensor of shape (n_phases, n_inputs)
+        if not torch.is_tensor(u):
+            u = torch.stack([
+            torch.tensor(ui, dtype=self.dtype, device=self.device) if not torch.is_tensor(ui)
+            else ui.to(dtype=self.dtype, device=self.device)
+            for ui in u
+            ])
+        else:
+            u = u.to(dtype=self.dtype, device=self.device)
+
+        # Convert delta to 1D tensor (n_phases,)
+        if not torch.is_tensor(delta):
+            delta = torch.tensor(delta, dtype=self.dtype, device=self.device)
+        else:
+            delta = delta.to(dtype=self.dtype, device=self.device)
+        delta = delta.view(-1)
+
+        # Ensure R has correct dtype/device
+        R = self.R.to(dtype=self.dtype, device=self.device)
+
+        # uR shape: (n_phases, n_inputs); elementwise multiply with u and sum over inputs gives u^T R u per phase
+        per_phase = (u @ R) * u
+        per_phase = per_phase.sum(dim=1)  # shape (n_phases,)
+
+        # Accumulate weighted by durations
+        G = 0.5 * (per_phase * delta).sum()
             
         return G
         
-    def cost_function(self, R, x0=None, sym_x0=False):
+    def cost_function(
+        self, 
+        u_all = None, 
+        delta_all = None, 
+        x0 = None
+    ):
         """
-        Returns a cost function that can be called with control inputs, phase durations, and initial state.
+        Compute total cost J.
+        
+        J = G0 + [x0; 1]' * S_0 * [x0; 1]
         
         Args:
-        R       (torch.Tensor or np.ndarray): The weight matrix for the control.
-        x0      (torch.Tensor or np.ndarray, optional): The initial state. If None, the value used in precompute_matrices is used.
-        sym_x0  (bool): If True, x0 is treated as a symbolic variable (passed as argument).
-                        If False, x0 is fixed to the value used in precompute_matrices.
+        u_all       (list of torch.Tensor): The control inputs for all phases.
+        delta_all   (list of torch.Tensor): The phase durations for all phases.
+        x0          (torch.Tensor): The initial state.
         
         Returns:
         callable: A function that takes (*u_list, *delta_list, x0) and returns the cost J.
         """
-        # Convert R to tensor if needed
-        if isinstance(R, np.ndarray):
-            R = torch.tensor(R, dtype=torch.float32, device=self.device)
-        
-        # Check if x0 is symbolic (we'll handle this differently in PyTorch)
-        if sym_x0:
-            # Return a lambda function that computes cost given x0
-            def cost(*args):
-                # Last argument is x0, others are u and delta
-                if self.n_inputs == 0:
-                    # args are: *delta, x0
-                    delta_vals = args[:-1]
-                    x0_val = args[-1]
-                else:
-                    # args are: *u, *delta, x0
-                    # u_vals is a list of n_phases tensors, each of shape (n_inputs,)
-                    u_vals = list(args[:self.n_phases])
-                    delta_vals = list(args[self.n_phases:self.n_phases + self.n_phases])
-                    x0_val = args[-1]
-                
-                # Ensure x0 is a tensor
-                if not isinstance(x0_val, torch.Tensor):
-                    x0_tensor = torch.tensor(x0_val, dtype=torch.float64)
-                else:
-                    x0_tensor = x0_val
-                
-                # Get device from x0_tensor
-                device = x0_tensor.device if isinstance(x0_tensor, torch.Tensor) else 'cpu'
-                
-                # Ensure all tensors are on the same device
-                x0_flat = x0_tensor.flatten().to(device)
-                ones_tensor = torch.ones(1, dtype=torch.float64, device=device)
-                x0_aug = torch.cat([x0_flat, ones_tensor])
-                
-                S0_tensor = torch.tensor(self.S[0], dtype=torch.float64, device=device) #if isinstance(self.S[0], np.ndarray) else self.S[0].to(device)
-                J = 0.5 * x0_aug @ S0_tensor @ x0_aug
-                
-                if self.n_inputs > 0:
-                    # Compute G matrix using the provided u and delta values, not self.u and self.delta
-                    G = 0
-                    R_tensor = torch.tensor(R, dtype=torch.float64, device=device) #if isinstance(R, np.ndarray) else R.to(dtype=torch.float64, device=device)
-                    
-                    for i in range(self.n_phases):
-                        # Use the u and delta values from the arguments, ensure correct dtype
-                        if isinstance(u_vals[i], torch.Tensor):
-                            u_i = u_vals[i].to(dtype=torch.float64, device=device)
-                        else:
-                            u_i = torch.tensor(u_vals[i], dtype=torch.float64, device=device)
-                            
-                        if isinstance(delta_vals[i], torch.Tensor):
-                            delta_i = delta_vals[i].to(dtype=torch.float64, device=device)
-                        else:
-                            delta_i = torch.tensor(delta_vals[i], dtype=torch.float64, device=device)
-                            
-                        pippo = 0.5 * (u_i @ R_tensor @ u_i) * delta_i
-                        G = G + pippo
-                    
-                    J = J + 0.5 * G
-                    
-                return J
-                
+       
+        # Ensure x0 is a tensor
+        if not isinstance(x0, torch.Tensor):
+            x0_tensor = torch.tensor(x0, dtype=self.dtype, device=self.device)
         else:
-            # Compute the cost function with numeric x0
-            x0 = np.reshape(x0, (-1, 1))
-            x0_tensor = torch.tensor(x0, dtype=torch.float64)
-            S0_tensor = torch.tensor(self.S[0], dtype=torch.float64) if isinstance(self.S[0], np.ndarray) else self.S[0]
-            J = 0.5 * x0_tensor.T @ S0_tensor @ x0_tensor
+            x0_tensor = x0
             
-            if self.n_inputs > 0:
-                J = J + 0.5 * self.G_matrix(R)
+        # Check if auto is True and set the inputs to zero
+        if self.auto and u_all is None:
+            u_all = torch.zeros((self.n_phases, 1), dtype=self.dtype, device=self.device)
+        
+        # Forward propagation
+        self.forward_propagate(u_all, delta_all)
+        
+        # Backward propagation
+        self.backward_propagate(u_all, delta_all, x0_tensor)
+        
+        # Control cost
+        if self.auto:
+            G0 = 0.0
+        else:
+            G0 = self.compute_G(u_all, delta_all)
+        
+        # Initial state augmentation
+        x0_aug = torch.cat([x0_tensor, torch.ones(1, device=self.device, dtype=self.dtype)])
+
+        J = 0.5 * x0_aug @ self.S[0] @ x0_aug + G0
             
-            # Return a lambda function that computes cost given u and delta
-            def cost(*args):
-                # Return the precomputed J (symbolic in terms of u and delta)
-                return J
-            
-        return cost
+        return J
         
     def grad_cost_function(self, index, R):
         """
@@ -852,96 +871,71 @@ class SwiLin:
         
         return du, d_delta
     
-    def precompute_matrices(self, x0, Q, R, E, xr=None) -> None:
+    def forward_propagate(
+        self, 
+        u_all: torch.Tensor,
+        delta_all: torch.Tensor,
+        xr=None
+    ) -> None:
         """
-        Precomputes the matrices that are necessary to write the cost function and its gradient.
+        Forward propagate the states through all phases.
         
         Args:
-        x0  (torch.Tensor or np.ndarray): The initial state.
-        Q   (torch.Tensor or np.ndarray): The weight matrix for the state.
-        R   (torch.Tensor or np.ndarray): The weight matrix for the control.
-        E   (torch.Tensor or np.ndarray): The weight matrix for the terminal state.
-        xr  (torch.Tensor or np.ndarray): The reference state.
-        """  
-        # Detect dtype from the first tensor input, or default to float32
-        # First check A matrices since they're loaded first
-        if len(self.A) > 0:
-            self.dtype = self.A[0].dtype
-        
-        # Convert inputs to tensors if they're numpy arrays and set consistent dtype
-        if isinstance(Q, np.ndarray):
-            Q = torch.tensor(Q, dtype=self.dtype, device=self.device)
-        else:
-            Q = Q.to(dtype=self.dtype, device=self.device)
-            
-        if isinstance(R, np.ndarray):
-            R = torch.tensor(R, dtype=self.dtype, device=self.device)
-        else:
-            R = R.to(dtype=self.dtype, device=self.device)
-            
-        if isinstance(E, np.ndarray):
-            E = torch.tensor(E, dtype=self.dtype, device=self.device)
-        else:
-            E = E.to(dtype=self.dtype, device=self.device)
-            
-        if isinstance(x0, np.ndarray):
-            x0 = torch.tensor(x0, dtype=self.dtype, device=self.device)
-        else:
-            x0 = x0.to(dtype=self.dtype, device=self.device)
-        
-        # Store R for later use
-        self.R_weight = R
-        
-        # Augment the weight matrices using block_diag from scipy
-        Q_np = Q.cpu().numpy()
-        E_np = E.cpu().numpy()
-        Q_ = torch.tensor(block_diag(Q_np, 0), dtype=torch.float32, device=self.device)
-        E_ = torch.tensor(block_diag(E_np, 0), dtype=torch.float32, device=self.device)
-        
-        # Initialize control inputs and phase durations as parameters
-        self.delta = [torch.tensor(0.0, dtype=torch.float32, device=self.device, requires_grad=True) 
-                      for _ in range(self.n_phases)]
-        
-        if self.n_inputs > 0:
-            self.u = [torch.zeros(self.n_inputs, dtype=torch.float32, device=self.device, requires_grad=True) 
-                      for _ in range(self.n_phases)]
+        u_all (torch.Tensor): Control inputs for all phases.
+        delta_all (torch.Tensor): Phase durations for all phases.
+        xr (torch.Tensor, optional): Reference state.
+        """       
         
         for i in range(self.n_phases):
+            u_i = u_all[i]
+            delta_i = delta_all[i]
             # Compute the matrix exponential properties
-            Ei, phi_f_i, Hi, Li, Mi, Ri = self.mat_exp_prop(i, Q, R)
-            self.E.append(Ei)
-            self.phi_f.append(phi_f_i)
-            self.H.append(Hi)
-            self.L.append(Li)
-            self.M.append(Mi)
-            self.R.append(Ri)
-        
-            if self.n_inputs > 0:
-                # Compute the D matrix
-                # D = self.D_matrix(i, Q_)
-                # self.D.append(D)
-            
-                # Compute the G matrix
-                G = self.G_matrix(R)
-                self.G.append(G)
+            if self.auto:
+                Ei, Li = self.mat_exp_prop(i, u_i, delta_i)
+            else:
+                Ei, phi_f_i, Hi, Li, Mi, Ki = self.mat_exp_prop(i, u_i, delta_i)
+            self.E[i] = Ei
+            self.L[i] = Li
+            if not self.auto:
+                self.phi_f[i] = phi_f_i
+                self.H[i] = Hi
+
+                self.M[i] = Mi
+                self.K[i] = Ki
+                
+    def backward_propagate(
+        self,
+        u_all: torch.Tensor,
+        delta_all: torch.Tensor,
+        x0: torch.Tensor,
+        xr=None
+    ) -> None:
         
         # Initialize the S matrix with the terminal cost (if needed)
-        self.S.append(0.5*E_)
+        # Augment E_term by adding a zero row and column
+        E_ = torch.zeros((self.n_states + 1, self.n_states + 1), dtype=self.dtype, device=self.device)
+        E_[:self.n_states, :self.n_states] = self.E_term
+        self.S[-1] = 0.5*E_
         if xr is not None:
             if isinstance(xr, np.ndarray):
-                xr = torch.tensor(xr, dtype=torch.float32, device=self.device)
-            xr_aug = torch.cat([xr, torch.ones(1, dtype=torch.float32, device=self.device)])
-            self.Sr.append(0.5*E_ @ xr_aug)
+                xr = torch.tensor(xr, dtype=self.dtype, device=self.device)
+            xr_aug = torch.cat([xr, torch.ones(1, dtype=self.dtype, device=self.device)])
+            self.Sr.append(0.5*self.E_term @ xr_aug)
 
         for i in range(self.n_phases-1, -1, -1):
+            u_i = u_all[i]
+            delta_i = delta_all[i]
+            
+            # Compute the S matrix (and Sr if needed)
             if xr is not None:
                 # Compute the S and Sr matrices
-                S, Sr = self.S_matrix(i, Q_)
-                self.S.insert(0, S)
+                S, Sr = self.S_matrix(i, u_i, delta_i, xr)
+                self.S[i] = S
+                self.Sr[i] = Sr
             else:
                 # Compute the S matrix
-                S = self.S_matrix(i, Q_)
-                self.S.insert(0, S)
+                S = self.S_matrix(i, u_i, delta_i)
+                self.S[i] = S
         
         # Compute the C and N matrices
         # for i in range(self.n_phases):
