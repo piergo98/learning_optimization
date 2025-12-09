@@ -7,8 +7,8 @@ import scipy.io
 from scipy.linalg import solve_continuous_are
 
 from ocslc.switched_linear_mpc import SwiLin
-from optimizers import StochasticGradientDescent, RMSPropOptimizer, AdamOptimizer
-from optimizers import sgd_optimize, rmsprop_optimize, adam_optimize
+from src import StochasticGradientDescent, RMSPropOptimizer, AdamOptimizer
+from src import sgd_optimize, rmsprop_optimize, adam_optimize
 from datetime import datetime
 import pathlib
 

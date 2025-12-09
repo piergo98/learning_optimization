@@ -11,7 +11,7 @@ This example shows how to:
 import numpy as np
 import torch
 import time
-from optimizers import gpu_optimize, Adam, SGD
+from src import gpu_optimize, Adam, SGD
 
 # Check if CUDA is available
 device = 'cuda' if torch.cuda.is_available() else 'cpu'

@@ -8,8 +8,8 @@ import torch
 from scipy.linalg import solve_continuous_are
 
 from ocslc.switched_linear_mpc import SwiLin
-from optimizers import SGD, Adam, RMSProp
-from optimizers import gpu_optimize
+from src import SGD, Adam, RMSProp
+from src import gpu_optimize
 
 # Check if CUDA is available
 device = 'cuda' if torch.cuda.is_available() else 'cpu'

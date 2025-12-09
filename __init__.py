@@ -4,6 +4,6 @@ __version__ = "0.1.0"
 
 # Import submodules
 from . import data
-from . import optimizers
+from . import src
 
-__all__ = ['data', 'optimizers']
+__all__ = ['data', 'src']

@@ -10,7 +10,7 @@ import numpy as np
 from scipy.linalg import solve_continuous_are
 
 from ocslc.switched_linear import SwiLin as SwiLin_casadi
-from optimizers.switched_linear_torch import SwiLin
+from src.switched_linear_torch import SwiLin
 from data.data_loader import load_data
 
 start = time.time()

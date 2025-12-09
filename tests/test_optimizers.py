@@ -8,15 +8,15 @@ import pytest
 
 def test_import_optimizers():
     """Test that the optimizers package can be imported."""
-    import optimizers
-    assert hasattr(optimizers, '__version__')
-    assert hasattr(optimizers, 'sgd_optimize')
-    assert hasattr(optimizers, 'StochasticGradientDescent')
+    import src
+    assert hasattr(src, '__version__')
+    assert hasattr(src, 'sgd_optimize')
+    assert hasattr(src, 'StochasticGradientDescent')
 
 
 def test_sgd_optimize_simple():
     """Test sgd_optimize on a simple quadratic problem."""
-    from optimizers import sgd_optimize
+    from src import sgd_optimize
     
     # Minimize ||x - target||^2
     target = np.array([1.0, 2.0, 3.0])
@@ -46,7 +46,7 @@ def test_sgd_optimize_simple():
 
 def test_adam_optimize():
     """Test adam_optimize on a simple problem."""
-    from optimizers import adam_optimize
+    from src import adam_optimize
     
     target = np.array([5.0, -3.0])
     
@@ -67,7 +67,7 @@ def test_adam_optimize():
 
 def test_rmsprop_optimize():
     """Test rmsprop_optimize on a simple problem."""
-    from optimizers import rmsprop_optimize
+    from src import rmsprop_optimize
     
     target = np.array([2.0, -1.0, 0.5])
     
@@ -88,8 +88,8 @@ def test_rmsprop_optimize():
 
 def test_torch_available_flag():
     """Test that _TORCH_AVAILABLE flag is set correctly."""
-    import optimizers
-    assert isinstance(optimizers._TORCH_AVAILABLE, bool)
+    import src
+    assert isinstance(src._TORCH_AVAILABLE, bool)
 
 
 @pytest.mark.skipif(
@@ -98,7 +98,7 @@ def test_torch_available_flag():
 )
 def test_gpu_optimize_cpu():
     """Test GPU optimize on CPU (if torch available)."""
-    from optimizers import gpu_optimize
+    from src import gpu_optimize
     import torch
     
     target = torch.tensor([1.0, 2.0])

@@ -793,6 +793,8 @@ def example_pannocchia_torch():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     date = subprocess.check_output(['date', '+%Y%m%d_%H%M%S']).decode('utf-8').strip()
     tensorboard_logdir = os.path.join(script_dir, "..", "logs", date)
+    model_name = f"pannocchia_torch_{date}.pt"
+    models_dir = os.path.join(script_dir, "..", "models", model_name)
     
     params_opt, history = train_neural_network(
         network=network,
@@ -808,6 +810,8 @@ def example_pannocchia_torch():
         verbose=True,
         tensorboard_logdir=tensorboard_logdir,
         log_histograms=False,
+        save_model=True,
+        save_model_path=models_dir
         
     )
     
