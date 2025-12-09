@@ -7,7 +7,7 @@ import pytest
 
 def test_neural_network_numpy_creation():
     """Test NeuralNetworkNumPy initialization."""
-    from src.neural_network import NeuralNetworkNumPy
+    from src.training import NeuralNetworkNumPy
     
     network = NeuralNetworkNumPy(
         layer_sizes=[10, 5, 3],
@@ -22,7 +22,7 @@ def test_neural_network_numpy_creation():
 
 def test_neural_network_forward_pass():
     """Test forward pass through network."""
-    from src.neural_network import NeuralNetworkNumPy
+    from src.training import NeuralNetworkNumPy
     
     network = NeuralNetworkNumPy(
         layer_sizes=[4, 5, 3],
@@ -40,7 +40,7 @@ def test_neural_network_forward_pass():
 
 def test_neural_network_gradient_computation():
     """Test gradient computation."""
-    from src.neural_network import NeuralNetworkNumPy
+    from src.training import NeuralNetworkNumPy
     
     network = NeuralNetworkNumPy(
         layer_sizes=[4, 5, 3],
@@ -60,7 +60,7 @@ def test_neural_network_gradient_computation():
 
 def test_train_neural_network_numpy_simple():
     """Test neural network training on simple problem."""
-    from src.neural_network import NeuralNetworkNumPy, train_neural_network_numpy
+    from src.training import NeuralNetworkNumPy, train_neural_network_numpy
     
     # Simple linearly separable problem
     np.random.seed(42)
@@ -92,7 +92,7 @@ def test_train_neural_network_numpy_simple():
 
 def test_compute_accuracy():
     """Test accuracy computation."""
-    from src.neural_network import compute_accuracy
+    from src.training import compute_accuracy
     
     # Perfect predictions
     predictions = np.array([[0.1, 0.9], [0.8, 0.2], [0.3, 0.7]])
@@ -115,7 +115,7 @@ def test_compute_accuracy():
 )
 def test_neural_network_pytorch_creation():
     """Test NeuralNetworkPyTorch initialization."""
-    from src.neural_network import NeuralNetworkPyTorch
+    from src.training import NeuralNetworkPyTorch
     
     network = NeuralNetworkPyTorch(
         layer_sizes=[10, 5, 3],
@@ -133,7 +133,7 @@ def test_neural_network_pytorch_creation():
 )
 def test_neural_network_pytorch_forward():
     """Test PyTorch network forward pass."""
-    from src.neural_network import NeuralNetworkPyTorch
+    from src.training import NeuralNetworkPyTorch
     import torch
     
     network = NeuralNetworkPyTorch(
@@ -155,7 +155,7 @@ def test_neural_network_pytorch_forward():
 )
 def test_train_neural_network_torch_simple():
     """Test PyTorch neural network training on simple problem."""
-    from src.neural_network import NeuralNetworkPyTorch, train_neural_network_torch
+    from src.training import NeuralNetworkPyTorch, train_neural_network_torch
     import torch
     
     torch.manual_seed(42)
