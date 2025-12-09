@@ -56,7 +56,7 @@ if TORCH_AVAILABLE:
         def __init__(
             self,
             layer_sizes: List[int],
-            n_phases: int,
+            n_phases: int = 80,
             activation: str = 'relu',
             output_activation: str = 'linear'
         ):
@@ -607,6 +607,14 @@ if TORCH_AVAILABLE:
                 delta_normalized = F.softmax(delta_raw, dim=-1)
                 deltas = delta_normalized * T_tensor # shape (batch_size, n_phases)
                 
+                # Clip controls using tanh-based soft clipping to preserve gradients
+                u_min = -1.0  # Define your lower bound
+                u_max = 1.0   # Define your upper bound
+                u_center = (u_max + u_min) / 2.0
+                u_range = (u_max - u_min) / 2.0
+                # Soft clipping: maps (-inf, inf) to (u_min, u_max) smoothly
+                controls = u_center + u_range * torch.tanh(controls)
+                
                 transformed_output = torch.cat([controls, deltas], dim=-1) # shape (batch_size, n_phases * (n_inputs + 1))
                 
                 # Instead of the for loop, I have to give the full batch to the cost function
@@ -658,6 +666,13 @@ if TORCH_AVAILABLE:
                     # Transform validation output
                     n_control_outputs = network.n_phases * n_inputs
                     val_controls = val_output[:, :n_control_outputs]
+                    # Clip controls using tanh-based soft clipping to preserve gradients
+                    u_min = -1.0  # Define your lower bound
+                    u_max = 1.0   # Define your upper bound
+                    u_center = (u_max + u_min) / 2.0
+                    u_range = (u_max - u_min) / 2.0
+                    # Soft clipping: maps (-inf, inf) to (u_min, u_max) smoothly
+                    val_controls = u_center + u_range * torch.tanh(val_controls)
                     val_delta_raw = val_output[:, n_control_outputs:]
                     val_delta_normalized = F.softmax(val_delta_raw, dim=-1)
                     val_deltas = val_delta_normalized * T_tensor
@@ -732,21 +747,6 @@ if TORCH_AVAILABLE:
 
         return params_optimized, history
     
-    
-    def compute_accuracy_torch(predictions: torch.Tensor, targets: torch.Tensor) -> float:
-        """Compute classification accuracy for PyTorch tensors."""
-        if predictions.dim() == 2 and predictions.shape[1] > 1:
-            pred_classes = torch.argmax(predictions, dim=1)
-        else:
-            pred_classes = (predictions > 0.5).long()
-        
-        if targets.dim() == 2:
-            target_classes = torch.argmax(targets, dim=1)
-        else:
-            target_classes = targets
-        
-        return (pred_classes == target_classes).float().mean().item()
-
 
 # ============================================================================
 # Example Usage
