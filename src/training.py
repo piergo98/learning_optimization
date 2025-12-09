@@ -86,8 +86,6 @@ if TORCH_AVAILABLE:
             n_inputs = model['B'][0].shape[1]
 
             self.time_horizon = 10.0
-
-            x0 = np.array([2, -1, 5])
             
             xr = np.array([1, -3])
             
@@ -108,7 +106,6 @@ if TORCH_AVAILABLE:
             P = np.array(solve_continuous_are(model['A'][0], model['B'][0], Q, R))
 
             swi_lin.load_weights(Q, R, P)
-            x0_aug = np.append(x0, 1)  # augment with 1 for affine term
             
             # Store the cost function (now returns a callable)
             # self.cost_func = swi_lin.cost_function(R, sym_x0=True)
@@ -489,6 +486,7 @@ if TORCH_AVAILABLE:
         y_val: Optional[torch.Tensor] = None,
         optimizer: str = 'adam',
         learning_rate: float = 0.001,
+        weight_decay: float = 1e-4,
         n_epochs: int = 100,
         batch_size: int = 32,
         device: str = 'cpu',
@@ -499,6 +497,10 @@ if TORCH_AVAILABLE:
         save_history_path: Optional[str] = None,
         save_model: bool = False,
         save_model_path: Optional[str] = None,
+        early_stopping: bool = False,
+        early_stopping_patience: int = 20,
+        early_stopping_min_delta: float = 1e-6,
+        early_stopping_monitor: str = 'val_loss',
     ) -> Tuple[torch.Tensor, Dict]:
         """
         Train neural network using PyTorch GPU optimizers.
@@ -519,6 +521,8 @@ if TORCH_AVAILABLE:
             Optimizer name: 'sgd', 'adam', 'rmsprop'.
         learning_rate : float
             Learning rate.
+        weight_decay : float
+            L2 regularization weight decay.
         n_epochs : int
             Number of training epochs.
         batch_size : int
@@ -527,6 +531,26 @@ if TORCH_AVAILABLE:
             Device: 'cpu' or 'cuda'.
         verbose : bool
             Print training progress.
+        tensorboard_logdir : str, optional
+            Directory for TensorBoard logs.
+        log_histograms : bool
+            Whether to log parameter histograms to TensorBoard.
+        save_history : bool
+            Whether to save training history to JSON.
+        save_history_path : str, optional
+            Path to save training history JSON file.
+        save_model : bool
+            Whether to save the trained model.
+        save_model_path : str, optional
+            Path to save the trained model.
+        early_stopping : bool
+            Whether to use early stopping.
+        early_stopping_patience : int
+            Number of epochs with no improvement after which training will be stopped.
+        early_stopping_min_delta : float
+            Minimum change in monitored quantity to qualify as an improvement.
+        early_stopping_monitor : str
+            Metric to monitor for early stopping: 'val_loss' or 'train_loss'.
             
         Returns
         -------
@@ -547,13 +571,21 @@ if TORCH_AVAILABLE:
         
         # Initialize PyTorch optimizer
         if optimizer.lower() == 'adam':
-            torch_optimizer = torch.optim.Adam(network.parameters(), lr=learning_rate)
+            torch_optimizer = torch.optim.Adam(network.parameters(), lr=learning_rate, weight_decay=weight_decay)
         elif optimizer.lower() == 'sgd':
-            torch_optimizer = torch.optim.SGD(network.parameters(), lr=learning_rate)
+            torch_optimizer = torch.optim.SGD(network.parameters(), lr=learning_rate, weight_decay=weight_decay)
         elif optimizer.lower() == 'rmsprop':
-            torch_optimizer = torch.optim.RMSprop(network.parameters(), lr=learning_rate)
+            torch_optimizer = torch.optim.RMSprop(network.parameters(), lr=learning_rate, weight_decay=weight_decay)
         else:
             raise ValueError(f"Unknown optimizer '{optimizer}'. Supported: 'adam', 'sgd', 'rmsprop'")
+        
+        # Learning rate scheduler
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            torch_optimizer,
+            mode='min',
+            factor=0.5,
+            patience=10,
+        )
         
         # Training history
         history = {
@@ -561,6 +593,20 @@ if TORCH_AVAILABLE:
             'val_loss': [] if X_val is not None else None,
             'epochs': []
         }
+        
+        # Early stopping setup
+        if early_stopping:
+            if early_stopping_monitor == 'val_loss' and X_val is None:
+                warnings.warn("Early stopping monitor is 'val_loss' but no validation data provided. Switching to 'train_loss'.")
+                early_stopping_monitor = 'train_loss'
+            
+            best_loss = float('inf')
+            best_epoch = 0
+            patience_counter = 0
+            best_model_state = None
+            
+            if verbose:
+                print(f"Early stopping enabled: monitoring '{early_stopping_monitor}' with patience={early_stopping_patience}, min_delta={early_stopping_min_delta}")
         
         # Setup TensorBoard writer if requested
         writer = SummaryWriter(log_dir=tensorboard_logdir) if tensorboard_logdir is not None else None
@@ -685,10 +731,17 @@ if TORCH_AVAILABLE:
                     J_val = evaluate_cost_functional_batch(network.sys, val_controls, val_deltas, X_val)
                     avg_val_loss = J_val.mean().item()
                     history['val_loss'].append(avg_val_loss)
+            
+            # Step the learning rate scheduler
+            if X_val is not None:
+                scheduler.step(avg_val_loss)
+            else:
+                scheduler.step(avg_train_loss)
 
             # Write epoch-level scalars to TensorBoard
             if writer is not None:
                 writer.add_scalar('train/epoch_loss', avg_train_loss, epoch)
+                writer.add_scalar('train/learning_rate', torch_optimizer.param_groups[0]['lr'], epoch)
                 if X_val is not None:
                     writer.add_scalar('val/epoch_loss', avg_val_loss, epoch)
                 # Optionally log parameter histograms once per epoch
@@ -721,6 +774,39 @@ if TORCH_AVAILABLE:
                     print(f"Epoch {epoch + 1}/{n_epochs} - Train Loss: {avg_train_loss:.6f} - Val Loss: {avg_val_loss:.6f}")
                 else:
                     print(f"Epoch {epoch + 1}/{n_epochs} - Train Loss: {avg_train_loss:.6f}")
+            
+            # Early stopping check
+            if early_stopping:
+                # Determine which loss to monitor
+                current_loss = avg_val_loss if early_stopping_monitor == 'val_loss' else avg_train_loss
+                
+                # Check if there's improvement
+                if current_loss < best_loss - early_stopping_min_delta:
+                    best_loss = current_loss
+                    best_epoch = epoch
+                    patience_counter = 0
+                    # Save best model state
+                    best_model_state = {k: v.cpu().clone() for k, v in network.state_dict().items()}
+                    if verbose and epoch > 0:
+                        print(f"  → New best {early_stopping_monitor}: {best_loss:.6f}")
+                else:
+                    patience_counter += 1
+                    if verbose and patience_counter > 0 and (epoch + 1) % max(1, n_epochs // 10) == 0:
+                        print(f"  → No improvement for {patience_counter} epoch(s)")
+                
+                # Check if we should stop
+                if patience_counter >= early_stopping_patience:
+                    if verbose:
+                        print(f"\nEarly stopping triggered after {epoch + 1} epochs")
+                        print(f"Best {early_stopping_monitor}: {best_loss:.6f} at epoch {best_epoch + 1}")
+                    
+                    # Restore best model state
+                    if best_model_state is not None:
+                        network.load_state_dict(best_model_state)
+                        if verbose:
+                            print("Restored best model weights")
+                    
+                    break
         
         # Get final parameters
         params_optimized = network.get_flat_params()
@@ -739,11 +825,26 @@ if TORCH_AVAILABLE:
             except Exception:
                 warnings.warn(f"Failed to save model to {save_model_path}")
 
+        # Add early stopping info to history
+        if early_stopping:
+            history['early_stopping'] = {
+                'triggered': patience_counter >= early_stopping_patience,
+                'best_epoch': best_epoch,
+                'best_loss': best_loss,
+                'monitored_metric': early_stopping_monitor,
+                'patience': early_stopping_patience,
+                'final_epoch': epoch
+            }
+
         # Print final losses
         if verbose:
             print(f"\nFinal Training Loss: {history['train_loss'][-1]:.6f}")
             if X_val is not None and history['val_loss']:
                 print(f"Final Validation Loss: {history['val_loss'][-1]:.6f}")
+            if early_stopping and history.get('early_stopping', {}).get('triggered', False):
+                print(f"\nEarly stopping was triggered:")
+                print(f"  Best {early_stopping_monitor}: {best_loss:.6f} at epoch {best_epoch + 1}")
+                print(f"  Training stopped at epoch {epoch + 1}")
 
         return params_optimized, history
     
@@ -767,19 +868,21 @@ def example_pannocchia_torch():
     
     # Generate synthetic data
     torch.manual_seed(42)
-    n_samples = 10000
+    n_samples_train = 20000
+    n_samples_val = 200
     n_phases = 80
     n_control_inputs = 1
     n_NN_inputs = 3
     n_NN_outputs = n_phases * (n_control_inputs + 1)
     
-    X_train = torch.empty(n_samples, n_NN_inputs).uniform_(-5.0, 5.0)
+    X_train = torch.empty(n_samples_train, n_NN_inputs).uniform_(-5.0, 5.0)
     
-    X_val = torch.empty(200, n_NN_inputs).uniform_(-5.0, 5.0)
+    
+    X_val = torch.empty(n_samples_val, n_NN_inputs).uniform_(-5.0, 5.0)
     
     # Create network
     network = SwiLinNN(
-        layer_sizes=[n_NN_inputs, 128, 256, n_NN_outputs],
+        layer_sizes=[n_NN_inputs, 256, 512, n_NN_outputs],
         n_phases=n_phases,
         activation='relu',
         output_activation='linear'
@@ -804,10 +907,14 @@ def example_pannocchia_torch():
         # y_val=None,
         optimizer='adam',
         learning_rate=0.001,
+        weight_decay=1e-4,
         n_epochs=200,
-        batch_size=10000,
+        early_stopping=True,
+        early_stopping_patience=30,
+        early_stopping_min_delta=1e-4,
+        batch_size=n_samples_train,
         device=device,
-        verbose=True,
+        verbose=False,
         tensorboard_logdir=tensorboard_logdir,
         log_histograms=False,
         save_model=True,

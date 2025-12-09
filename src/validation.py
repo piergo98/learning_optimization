@@ -522,13 +522,13 @@ if __name__ == "__main__":
     n_NN_inputs = 3
     n_NN_outputs = n_phases * (n_control_inputs + 1)
     model = SwiLinNN(
-        layer_sizes=[n_NN_inputs, 128, 256, n_NN_outputs],
+        layer_sizes=[n_NN_inputs, 512, 256, n_NN_outputs],
         n_phases=n_phases,
     )
     model.to(device)
     
     # Load checkpoint
-    checkpoint_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'models', 'pannocchia_torch_20251209_112339.pt'))
+    checkpoint_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'models', 'pannocchia_torch_20251209_182122.pt'))
     model.load_state_dict(torch.load(checkpoint_path, map_location=device))
     # Set model to evaluation mode
     model.eval()
@@ -565,9 +565,9 @@ if __name__ == "__main__":
     # Plot the network output
     print("\nGenerating plot...")
     plot_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'images', 'network_output.png'))
-    # validator.plot_network_output(x0, save_path=None, show_ground_truth=True)
+    validator.plot_network_output(x0, save_path=None, show_ground_truth=True)
     
     # Plot piecewise constant control
     print("\nGenerating piecewise constant control plot...")
     piecewise_plot_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'images', 'piecewise_control.png'))
-    # validator.plot_piecewise_constant_control(x0, save_path=None, show_ground_truth=True)
+    validator.plot_piecewise_constant_control(x0, save_path=None, show_ground_truth=True)
