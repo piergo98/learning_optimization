@@ -81,7 +81,7 @@ class ModelValidator:
             criterion (Callable): Loss function to evaluate the model.
             
         Returns:
-            dict: A dictionary containing validation metrics.
+            float: Computed loss value.
         """
         # Load data
         # self.load_data(filename)
@@ -119,7 +119,7 @@ class ModelValidator:
         
         return loss.item()
 
-    def validate_on_custom_function(self, x0) -> Dict[str, float]:
+    def validate_on_cost_function(self, x0) -> Dict[str, float]:
         """
         Validate the cost function value based on the output of the model.
 
@@ -163,9 +163,9 @@ class ModelValidator:
         controls_args = [float(controls[0, i]) for i in range(n_phases)]
         duration_args = [float(phases_duration[i]) for i in range(n_phases)]
         cost_casadi_value = cost_casadi(*controls_args, *duration_args).full().item()
-        print(f"Cost value (Casadi SwiLin): {cost_casadi_value:.6f}")
+        # print(f"Cost value (Casadi SwiLin): {cost_casadi_value:.6f}")
         
-        print("Computing the cost function using the model output...")
+        # print("Computing the cost function using the model output...")
         with torch.no_grad():
             x0 = torch.as_tensor(x0, dtype=torch.float32, device=self.device).unsqueeze(0)
 
@@ -200,6 +200,134 @@ class ModelValidator:
             cost_data = swi_lin.cost_function(pred_u_reshaped, pred_deltas_squeezed, x0_squeezed)
             
         return cost_casadi_value, cost_data.item()
+    
+    def check_constraints(self, x0, u_min: float = -1.0, u_max: float = 1.0, verbose: bool = True) -> Dict[str, any]:
+        """
+        Check constraint violations for controls and phase durations.
+        
+        Args:
+            x0: Initial state tensor.
+            u_min (float): Minimum control value bound.
+            u_max (float): Maximum control value bound.
+            verbose (bool): Whether to print detailed constraint violation information.
+            
+        Returns:
+            dict: Dictionary containing constraint violation information:
+                - 'controls_in_bounds': bool, whether all controls satisfy bounds
+                - 'control_violations': dict with min/max violations
+                - 'durations_in_bounds': bool, whether all durations are in [0, T]
+                - 'duration_violations': dict with violations
+                - 'sum_constraint': bool, whether sum of durations equals T
+                - 'duration_sum': float, actual sum of durations
+                - 'duration_sum_error': float, error in sum constraint
+                - 'all_constraints_satisfied': bool, overall constraint satisfaction
+        """
+        n_inputs = self.n_inputs
+        n_phases = self.n_phases
+        T = self.model.sys.time_horizon
+        
+        with torch.no_grad():
+            x0 = torch.as_tensor(x0, dtype=torch.float32, device=self.device)
+            if x0.dim() == 1:
+                x0 = x0.unsqueeze(0)
+            
+            prediction = self.model(x0)
+            
+            # Apply transformation: T * softmax(output[-n_phases:]) for the deltas
+            T_tensor = torch.tensor(T, device=prediction.device, dtype=prediction.dtype)
+            
+            # Handle batch dimension properly
+            n_control_outputs = self.model.n_phases * n_inputs
+            pred_u = prediction[:, :n_control_outputs]
+            pred_delta_raw = prediction[:, n_control_outputs:]
+            
+            # Apply softmax and scale deltas
+            delta_normalized = F.softmax(pred_delta_raw, dim=-1)
+            pred_deltas = delta_normalized * T_tensor
+            
+            # Clip controls using tanh-based soft clipping
+            u_center = (u_max + u_min) / 2.0
+            u_range = (u_max - u_min) / 2.0
+            pred_u = u_center + u_range * torch.tanh(pred_u)
+            
+            # Reshape predictions
+            pred_u_reshaped = pred_u.squeeze(0).reshape(n_phases, n_inputs).cpu().numpy()
+            pred_deltas_np = pred_deltas.squeeze(0).cpu().numpy()
+        
+        # Check control constraints
+        u_min_violation = np.minimum(pred_u_reshaped - u_min, 0.0)
+        u_max_violation = np.maximum(pred_u_reshaped - u_max, 0.0)
+        
+        controls_in_bounds = np.all(u_min_violation == 0.0) and np.all(u_max_violation == 0.0)
+        
+        # Check duration constraints
+        duration_lower_violation = np.minimum(pred_deltas_np, 0.0)
+        duration_upper_violation = np.maximum(pred_deltas_np - T, 0.0)
+        
+        durations_in_bounds = np.all(duration_lower_violation == 0.0) and np.all(duration_upper_violation == 0.0)
+        
+        # Check sum constraint
+        duration_sum = np.sum(pred_deltas_np)
+        duration_sum_error = duration_sum - T
+        sum_constraint_satisfied = np.abs(duration_sum_error) < 1e-6
+        
+        all_constraints_satisfied = controls_in_bounds and durations_in_bounds and sum_constraint_satisfied
+        
+        results = {
+            'controls_in_bounds': controls_in_bounds,
+            'control_violations': {
+                'min_violation': float(np.min(u_min_violation)),
+                'max_violation': float(np.max(u_max_violation)),
+                'min_value': float(np.min(pred_u_reshaped)),
+                'max_value': float(np.max(pred_u_reshaped)),
+            },
+            'durations_in_bounds': durations_in_bounds,
+            'duration_violations': {
+                'lower_violation': float(np.min(duration_lower_violation)),
+                'upper_violation': float(np.max(duration_upper_violation)),
+                'min_value': float(np.min(pred_deltas_np)),
+                'max_value': float(np.max(pred_deltas_np)),
+            },
+            'sum_constraint': sum_constraint_satisfied,
+            'duration_sum': float(duration_sum),
+            'duration_sum_error': float(duration_sum_error),
+            'time_horizon': float(T),
+            'all_constraints_satisfied': all_constraints_satisfied,
+        }
+        
+        if verbose:
+            print("="*60)
+            print("CONSTRAINT VIOLATION CHECK")
+            print("="*60)
+            print(f"\nControl Constraints (bounds: [{u_min}, {u_max}]):")
+            print(f"  ✓ In bounds: {controls_in_bounds}")
+            print(f"  Min control value: {results['control_violations']['min_value']:.6f}")
+            print(f"  Max control value: {results['control_violations']['max_value']:.6f}")
+            if not controls_in_bounds:
+                print(f"  ⚠ Min violation: {results['control_violations']['min_violation']:.6f}")
+                print(f"  ⚠ Max violation: {results['control_violations']['max_violation']:.6f}")
+            
+            print(f"\nPhase Duration Constraints (bounds: [0, {T}]):")
+            print(f"  ✓ In bounds: {durations_in_bounds}")
+            print(f"  Min duration: {results['duration_violations']['min_value']:.6f}")
+            print(f"  Max duration: {results['duration_violations']['max_value']:.6f}")
+            if not durations_in_bounds:
+                print(f"  ⚠ Lower bound violation: {results['duration_violations']['lower_violation']:.6f}")
+                print(f"  ⚠ Upper bound violation: {results['duration_violations']['upper_violation']:.6f}")
+            
+            print(f"\nDuration Sum Constraint (should equal {T}):")
+            print(f"  ✓ Satisfied: {sum_constraint_satisfied}")
+            print(f"  Sum of durations: {results['duration_sum']:.6f}")
+            print(f"  Error: {results['duration_sum_error']:.6e}")
+            
+            print(f"\n{'='*60}")
+            if all_constraints_satisfied:
+                print("✓ ALL CONSTRAINTS SATISFIED")
+            else:
+                print("⚠ SOME CONSTRAINTS VIOLATED")
+            print("="*60)
+        
+        return results
     
     def plot_network_output(self, x0, save_path: Optional[str] = None, show_ground_truth: bool = True) -> None:
         """
@@ -417,18 +545,29 @@ if __name__ == "__main__":
     # Validate on data
     criterion = nn.MSELoss()
     loss = validator.validate_on_data(x0, criterion)
-    print(f"Validation loss on data: {loss:.6f}")
+    print("="*60)
+    print("COMPARING MODEL OUTPUT TO GROUND TRUTH DATA")
+    print("="*60)
+    print(f"\nMSE data w.r.t. ground truth: {loss:.6f}\n")
     
     # Validate on custom function
-    cost_casadi, cost_data = validator.validate_on_custom_function(x0)
-    print(f"Cost comparison - Casadi: {cost_casadi:.6f}, Data: {cost_data:.6f}")
+    cost_casadi, cost_data = validator.validate_on_cost_function(x0)
+    print("="*60)
+    print("COMPARING COST FUNCTION VALUES")
+    print("="*60)
+    print(f"\nCost comparison - Casadi: {cost_casadi:.6f}, Neural Network: {cost_data:.6f}")
+    print(f"Cost difference: {abs(cost_casadi - cost_data):.6f}")
+    print(f"Relative error: {abs(cost_casadi - cost_data) / abs(cost_casadi):.6f}\n")
+    
+    # Check constraints
+    constraint_results = validator.check_constraints(x0, u_min=-1.0, u_max=1.0, verbose=True)
     
     # Plot the network output
     print("\nGenerating plot...")
-    # plot_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'network_output.png'))
+    plot_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'images', 'network_output.png'))
     # validator.plot_network_output(x0, save_path=None, show_ground_truth=True)
     
     # Plot piecewise constant control
     print("\nGenerating piecewise constant control plot...")
-    # piecewise_plot_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'piecewise_control.png'))
-    validator.plot_piecewise_constant_control(x0, save_path=None, show_ground_truth=True)
+    piecewise_plot_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'images', 'piecewise_control.png'))
+    # validator.plot_piecewise_constant_control(x0, save_path=None, show_ground_truth=True)
