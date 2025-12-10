@@ -81,7 +81,7 @@ class SwiLin:
         # Control input defined as a tensor of shape (n_phases, n_inputs)
         if not self.auto:
             self.n_inputs = n_inputs
-            self.phi_f = torch.zeros(self.n_phases, self.n_states, self.n_inputs, dtype=self.dtype, device=self.device)
+            self.phi_f = torch.zeros(self.n_phases, self.n_states, 1, dtype=self.dtype, device=self.device)
             self.H = torch.zeros(self.n_phases, self.n_inputs, self.n_states + 1, self.n_states + 1, dtype=self.dtype, device=self.device)
             self.M = torch.zeros(self.n_phases, self.n_states, self.n_inputs, dtype=self.dtype, device=self.device)
             self.K = torch.zeros(self.n_phases, self.n_inputs, self.n_inputs, dtype=self.dtype, device=self.device)
