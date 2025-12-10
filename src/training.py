@@ -78,14 +78,36 @@ if TORCH_AVAILABLE:
         def switched_problem(self, n_phases: int):
             """Define switched linear problem."""
             model = {
-                'A': [np.array([[-0.1, 0, 0], [0, -2, -6.25], [0, 4, 0]])],
-                'B': [np.array([[0.25], [2], [0]])],
+                'A': [
+                    np.array([[-2.5, 0.5, 0.3], [0.4, -2.0, 0.6], [0.2, 0.3, -1.8]]),
+                    np.array([[-1.9, 3.2, 0.4], [0.3, -2.1, 0.5], [0, 0.6, -2.3]]),
+                    np.array([[-2.2, 0, 0.5],   [0.2, -1.7, 0.4], [0.3, 0.2, -2.0]]),
+                    np.array([[-1.8, 0.3, 0.2], [0.5, -2.4, 0],   [0.4, 0, -2.2]]),
+                    np.array([[-2.0, 0.4, 0],   [0.3, -2.2, 0.2], [0.5, 0.3, -1.9]]),
+                    np.array([[-2.3, 0.2, 0.3], [0, -2.0, 0.4],   [0.2, 0.5, -2.1]]),
+                    np.array([[-1.7, 0.5, 0.4], [0.2, -2.5, 0.3], [1.1, 0.2, -2.4]]),
+                    np.array([[-2.1, 0.3, 0.2], [0.4, -1.9, 0.5], [0.3, 0.1, -2.0]]),
+                    np.array([[-2.4, 0, 0.5],   [0.2, -2.3, 0.3], [0.4, 0.2, -1.8]]),
+                    np.array([[-1.8, 0.4, 0.3], [0.5, -2.1, 0.2], [0.2, 3.1, -2.2]]),
+                ],
+                'B': [
+                    np.array([[1.5, 0.3], [0.4, 1.2], [0.2, 0.8]]),
+                    np.array([[1.2, 0.5], [0.3, 0.9], [0.4, 1.1]]),
+                    np.array([[1.0, 0.4], [0.5, 1.3], [0.3, 0.7]]),
+                    np.array([[1.4, 0.2], [0.6, 1.0], [0.1, 0.9]]),
+                    np.array([[1.3, 0.1], [0.2, 1.4], [0.5, 0.6]]),
+                    np.array([[1.1, 0.3], [0.4, 1.5], [0.2, 0.8]]),
+                    np.array([[1.6, 0.2], [0.3, 1.1], [0.4, 0.7]]),
+                    np.array([[1.0, 0.4], [0.5, 1.2], [0.3, 0.9]]),
+                    np.array([[1.2, 0.5], [0.1, 1.3], [0.6, 0.8]]),
+                    np.array([[1.4, 0.3], [0.2, 1.0], [0.5, 0.7]]),
+                ],
             }
 
             n_states = model['A'][0].shape[0]
             n_inputs = model['B'][0].shape[1]
 
-            self.time_horizon = 10.0
+            self.time_horizon = 2.0
             
             xr = np.array([1, -3])
             
@@ -100,12 +122,11 @@ if TORCH_AVAILABLE:
             # Load model
             swi_lin.load_model(model)
 
-            Q = 1. * np.eye(n_states)
-            R = 0.1 * np.eye(n_inputs)
-            # Solve the Algebraic Riccati Equation
-            P = np.array(solve_continuous_are(model['A'][0], model['B'][0], Q, R))
+            Q = 10. * np.eye(n_states)
+            R = 10. * np.eye(n_inputs)
+            E = 1. * np.eye(n_states)
 
-            swi_lin.load_weights(Q, R, P)
+            swi_lin.load_weights(Q, R, E)
             
             # Store the cost function (now returns a callable)
             # self.cost_func = swi_lin.cost_function(R, sym_x0=True)
@@ -490,6 +511,10 @@ if TORCH_AVAILABLE:
         n_epochs: int = 100,
         batch_size: int = 32,
         device: str = 'cpu',
+        # Resampling options: regenerate new random samples every N epochs
+        resample_every: Optional[int] = None,
+        resample_fn: Optional[Callable[[int], torch.Tensor]] = None,
+        resample_val: bool = False,
         verbose: bool = True,
         tensorboard_logdir: Optional[str] = None,
         log_histograms: bool = False,
@@ -529,6 +554,17 @@ if TORCH_AVAILABLE:
             Mini-batch size.
         device : str
             Device: 'cpu' or 'cuda'.
+        resample_every : int or None
+            If provided, regenerate training samples every `resample_every` epochs.
+            Set to `None` to disable automatic resampling.
+        resample_fn : callable or None
+            Function called to generate new samples. It should accept the current
+            epoch (int) and return either a new `X_train` tensor or a tuple
+            `(X_train, X_val)`. If `None` a default uniform sampler between the
+            observed min/max of `X_train` is used.
+        resample_val : bool
+            If True and `resample_fn` returns validation samples, replace `X_val`
+            as well when resampling.
         verbose : bool
             Print training progress.
         tensorboard_logdir : str, optional
@@ -565,6 +601,25 @@ if TORCH_AVAILABLE:
         
         if X_val is not None:
             X_val = X_val.to(device)
+
+        # Setup a default resampling function if requested but none provided.
+        # Default resampler draws uniformly between observed min/max of X_train
+        if resample_every is not None and resample_every > 0 and resample_fn is None:
+            try:
+                # x_min = float(X_train.min().item())
+                x_min = -5.0
+                # x_max = float(X_train.max().item())
+                x_max = 5.0
+            except Exception:
+                x_min, x_max = -1.0, 1.0
+
+            def _default_resample_fn(epoch, shape=X_train.shape, dtype=X_train.dtype, device_str=device, xmin=x_min, xmax=x_max):
+                # create tensor on correct device/dtype
+                dev = device_str
+                out = torch.empty(shape, dtype=dtype, device=dev).uniform_(xmin, xmax)
+                return out
+
+            resample_fn = _default_resample_fn
         
         n_samples = X_train.shape[0]
         n_inputs = network.sys.n_inputs
@@ -625,6 +680,34 @@ if TORCH_AVAILABLE:
             epoch_loss = 0.0
             n_batches = 0
             
+            # Optionally resample training (and validation) data every `resample_every` epochs
+            if resample_every is not None and resample_every > 0 and epoch > 0 and (epoch % resample_every) == 0:
+                if resample_fn is None:
+                    warnings.warn("resample_every set but resample_fn is None; skipping resampling.")
+                else:
+                    try:
+                        new_data = resample_fn(epoch)
+                        # support returning either X_train or (X_train, X_val)
+                        if isinstance(new_data, (list, tuple)) and len(new_data) == 2:
+                            new_X_train, new_X_val = new_data
+                        else:
+                            new_X_train, new_X_val = new_data, None
+
+                        if not torch.is_tensor(new_X_train):
+                            new_X_train = torch.as_tensor(new_X_train)
+                        X_train = new_X_train.to(device)
+                        n_samples = X_train.shape[0]
+
+                        if resample_val and new_X_val is not None:
+                            if not torch.is_tensor(new_X_val):
+                                new_X_val = torch.as_tensor(new_X_val)
+                            X_val = new_X_val.to(device)
+
+                        if verbose:
+                            print(f"Resampled training data at epoch {epoch + 1}")
+                    except Exception as e:
+                        warnings.warn(f"Resampling failed at epoch {epoch + 1}: {e}")
+
             # Create random batches
             indices = torch.randperm(n_samples, device=device)
             
@@ -854,7 +937,7 @@ if TORCH_AVAILABLE:
 # ============================================================================
 
 
-def example_pannocchia_torch():
+def example_torch():
     """
     Example: Train neural network on NAHS example using PyTorch optimizer.
     """
@@ -868,21 +951,21 @@ def example_pannocchia_torch():
     
     # Generate synthetic data
     torch.manual_seed(42)
-    n_samples_train = 20000
+    n_samples_train = 10000
     n_samples_val = 200
-    n_phases = 80
-    n_control_inputs = 1
+    n_phases = 50
+    n_control_inputs = 2
     n_NN_inputs = 3
     n_NN_outputs = n_phases * (n_control_inputs + 1)
     
-    X_train = torch.empty(n_samples_train, n_NN_inputs).uniform_(-5.0, 5.0)
+    X_train = torch.empty(n_samples_train, n_NN_inputs).uniform_(-10.0, 10.0)
     
     
-    X_val = torch.empty(n_samples_val, n_NN_inputs).uniform_(-5.0, 5.0)
+    X_val = torch.empty(n_samples_val, n_NN_inputs).uniform_(-10.0, 10.0)
     
     # Create network
     network = SwiLinNN(
-        layer_sizes=[n_NN_inputs, 256, 512, n_NN_outputs],
+        layer_sizes=[n_NN_inputs, 512, 256, n_NN_outputs],
         n_phases=n_phases,
         activation='relu',
         output_activation='linear'
@@ -896,7 +979,7 @@ def example_pannocchia_torch():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     date = subprocess.check_output(['date', '+%Y%m%d_%H%M%S']).decode('utf-8').strip()
     tensorboard_logdir = os.path.join(script_dir, "..", "logs", date)
-    model_name = f"pannocchia_torch_{date}.pt"
+    model_name = f"nahs_torch_{date}.pt"
     models_dir = os.path.join(script_dir, "..", "models", model_name)
     
     params_opt, history = train_neural_network(
@@ -909,6 +992,9 @@ def example_pannocchia_torch():
         learning_rate=0.001,
         weight_decay=1e-4,
         n_epochs=200,
+        resample_every=None,
+        resample_fn=None,
+        resample_val=False,
         early_stopping=True,
         early_stopping_patience=30,
         early_stopping_min_delta=1e-4,
@@ -967,6 +1053,6 @@ if __name__ == "__main__":
     
     # Run PyTorch example
     start = time.time()
-    example_pannocchia_torch()
+    example_torch()
     end = time.time()
     print(f"PyTorch example took {end - start:.2f} seconds")
