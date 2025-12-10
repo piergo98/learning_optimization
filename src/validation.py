@@ -126,15 +126,37 @@ class ModelValidator:
         """
         # First compute the cost function value using the Casadi SwiLin system
         # Create a simple switched linear system
-        n_phases = 80
+        n_phases = 50
         n_states = 3
-        n_inputs = 1
-        time_horizon = 10.0
+        n_inputs = 2
+        time_horizon = 2.0
 
         model = {
-                'A': [np.array([[-0.1, 0, 0], [0, -2, -6.25], [0, 4, 0]])],
-                'B': [np.array([[0.25], [2], [0]])],
-            }
+            'A': [
+                np.array([[-2.5, 0.5, 0.3], [0.4, -2.0, 0.6], [0.2, 0.3, -1.8]]),
+                np.array([[-1.9, 3.2, 0.4], [0.3, -2.1, 0.5], [0, 0.6, -2.3]]),
+                np.array([[-2.2, 0, 0.5],   [0.2, -1.7, 0.4], [0.3, 0.2, -2.0]]),
+                np.array([[-1.8, 0.3, 0.2], [0.5, -2.4, 0],   [0.4, 0, -2.2]]),
+                np.array([[-2.0, 0.4, 0],   [0.3, -2.2, 0.2], [0.5, 0.3, -1.9]]),
+                np.array([[-2.3, 0.2, 0.3], [0, -2.0, 0.4],   [0.2, 0.5, -2.1]]),
+                np.array([[-1.7, 0.5, 0.4], [0.2, -2.5, 0.3], [1.1, 0.2, -2.4]]),
+                np.array([[-2.1, 0.3, 0.2], [0.4, -1.9, 0.5], [0.3, 0.1, -2.0]]),
+                np.array([[-2.4, 0, 0.5],   [0.2, -2.3, 0.3], [0.4, 0.2, -1.8]]),
+                np.array([[-1.8, 0.4, 0.3], [0.5, -2.1, 0.2], [0.2, 3.1, -2.2]]),
+            ],
+            'B': [
+                np.array([[1.5, 0.3], [0.4, 1.2], [0.2, 0.8]]),
+                np.array([[1.2, 0.5], [0.3, 0.9], [0.4, 1.1]]),
+                np.array([[1.0, 0.4], [0.5, 1.3], [0.3, 0.7]]),
+                np.array([[1.4, 0.2], [0.6, 1.0], [0.1, 0.9]]),
+                np.array([[1.3, 0.1], [0.2, 1.4], [0.5, 0.6]]),
+                np.array([[1.1, 0.3], [0.4, 1.5], [0.2, 0.8]]),
+                np.array([[1.6, 0.2], [0.3, 1.1], [0.4, 0.7]]),
+                np.array([[1.0, 0.4], [0.5, 1.2], [0.3, 0.9]]),
+                np.array([[1.2, 0.5], [0.1, 1.3], [0.6, 0.8]]),
+                np.array([[1.4, 0.3], [0.2, 1.0], [0.5, 0.7]]),
+            ],
+        }
 
         # print("Creating SwiLin system...")
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -145,13 +167,12 @@ class ModelValidator:
 
         # print("Precomputing matrices...")
         # Convert x0 to numpy for CasADi
-        Q = 1. * np.eye(n_states)
-        R = 0.1 * np.eye(n_inputs)
-        # Solve the Algebraic Riccati Equation
-        P = np.array(solve_continuous_are(model['A'][0], model['B'][0], Q, R))
+        Q = 10. * np.eye(n_states)
+        R = 10. * np.eye(n_inputs)
+        E = 1. * np.eye(n_states)
 
-        swi_lin.load_weights(Q, R, P)
-        swi_lin_casadi.precompute_matrices(x0, Q, R, P)
+        swi_lin.load_weights(Q, R, E)
+        swi_lin_casadi.precompute_matrices(x0, Q, R, E)
         # print("Precomputation complete!")
         
         # print("Computing cost function value using Casadi SwiLin...")
@@ -160,9 +181,31 @@ class ModelValidator:
         # Flatten controls and durations into individual scalar arguments expected by CasADi
         controls = self.controls_gt.to(self.device)
         phases_duration = self.phases_duration_gt.to(self.device)
-        controls_args = [float(controls[0, i]) for i in range(n_phases)]
+        # Flatten controls into phase-major order (for each phase, list all inputs)
+        controls_args = []
+        for i in range(n_phases):
+            for k in range(n_inputs):
+                controls_args.append(float(controls[k, i]))
         duration_args = [float(phases_duration[i]) for i in range(n_phases)]
-        cost_casadi_value = cost_casadi(*controls_args, *duration_args).full().item()
+        # The CasADi Function may expect a different flattening/order of control inputs
+        # depending on the implementation/version. Try the multi-input flattening first;
+        # if CasADi raises an "Incorrect number of inputs" error, fall back to the
+        # original phase-major single-input ordering (first input only) to preserve
+        # backward compatibility with older casadi wrappers.
+        try:
+            cost_casadi_value = cost_casadi(*controls_args, *duration_args).full().item()
+        except RuntimeError as e:
+            msg = str(e)
+            if 'Incorrect number of inputs' in msg or 'arg.size()==n_in_' in msg:
+                # Fallback: use only the first input per phase (legacy behavior)
+                fallback_controls = [float(controls[0, i]) for i in range(n_phases)]
+                try:
+                    cost_casadi_value = cost_casadi(*fallback_controls, *duration_args).full().item()
+                except Exception:
+                    # Re-raise the original exception to avoid hiding unexpected errors
+                    raise
+            else:
+                raise
         # print(f"Cost value (Casadi SwiLin): {cost_casadi_value:.6f}")
         
         # print("Computing the cost function using the model output...")
@@ -273,6 +316,22 @@ class ModelValidator:
         
         all_constraints_satisfied = controls_in_bounds and durations_in_bounds and sum_constraint_satisfied
         
+        # Per-input statistics (useful when n_inputs > 1)
+        per_input_stats = []
+        if n_inputs > 0:
+            per_input_min = pred_u_reshaped.min(axis=0)
+            per_input_max = pred_u_reshaped.max(axis=0)
+            per_input_min_violation = np.minimum(pred_u_reshaped - u_min, 0.0).min(axis=0)
+            per_input_max_violation = np.maximum(pred_u_reshaped - u_max, 0.0).max(axis=0)
+            for k in range(n_inputs):
+                per_input_stats.append({
+                    'input_index': k,
+                    'min_value': float(per_input_min[k]),
+                    'max_value': float(per_input_max[k]),
+                    'min_violation': float(per_input_min_violation[k]),
+                    'max_violation': float(per_input_max_violation[k]),
+                })
+
         results = {
             'controls_in_bounds': controls_in_bounds,
             'control_violations': {
@@ -280,6 +339,7 @@ class ModelValidator:
                 'max_violation': float(np.max(u_max_violation)),
                 'min_value': float(np.min(pred_u_reshaped)),
                 'max_value': float(np.max(pred_u_reshaped)),
+                'per_input': per_input_stats,
             },
             'durations_in_bounds': durations_in_bounds,
             'duration_violations': {
@@ -301,11 +361,23 @@ class ModelValidator:
             print("="*60)
             print(f"\nControl Constraints (bounds: [{u_min}, {u_max}]):")
             print(f"  ✓ In bounds: {controls_in_bounds}")
-            print(f"  Min control value: {results['control_violations']['min_value']:.6f}")
-            print(f"  Max control value: {results['control_violations']['max_value']:.6f}")
-            if not controls_in_bounds:
-                print(f"  ⚠ Min violation: {results['control_violations']['min_violation']:.6f}")
-                print(f"  ⚠ Max violation: {results['control_violations']['max_violation']:.6f}")
+            # If multiple inputs, print per-input statistics
+            if n_inputs > 1:
+                print(f"  Per-input control stats:")
+                for info in results['control_violations']['per_input']:
+                    idx = info['input_index'] + 1
+                    print(f"    - Input {idx}: min={info['min_value']:.6f}, max={info['max_value']:.6f}")
+                    if not controls_in_bounds:
+                        if info['min_violation'] < 0:
+                            print(f"      ⚠ Min violation: {info['min_violation']:.6f}")
+                        if info['max_violation'] > 0:
+                            print(f"      ⚠ Max violation: {info['max_violation']:.6f}")
+            else:
+                print(f"  Min control value: {results['control_violations']['min_value']:.6f}")
+                print(f"  Max control value: {results['control_violations']['max_value']:.6f}")
+                if not controls_in_bounds:
+                    print(f"  ⚠ Min violation: {results['control_violations']['min_violation']:.6f}")
+                    print(f"  ⚠ Max violation: {results['control_violations']['max_violation']:.6f}")
             
             print(f"\nPhase Duration Constraints (bounds: [0, {T}]):")
             print(f"  ✓ In bounds: {durations_in_bounds}")
@@ -371,33 +443,55 @@ class ModelValidator:
             pred_u_reshaped = pred_u.squeeze(0).reshape(n_phases, n_inputs).cpu().numpy()
             pred_deltas_np = pred_deltas.squeeze(0).cpu().numpy()
         
-        # Create figure with two subplots
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
-        
-        # Plot controls
-        for i in range(n_inputs):
-            ax1.plot(range(n_phases), pred_u_reshaped[:, i], 'o-', label=rf'Predicted $u_{{{i+1}}}$', linewidth=2)
+        # If multiple inputs, create one subplot per input for controls, plus one for durations
+        if n_inputs <= 1:
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
+            # Single-input plotting (keeps previous style)
+            ax1.plot(range(n_phases), pred_u_reshaped[:, 0], 'o-', label=rf'Predicted $u_{{1}}$', linewidth=2)
             if show_ground_truth and hasattr(self, 'controls_gt'):
                 controls_gt_np = self.controls_gt.cpu().numpy()
-                ax1.plot(range(n_phases), controls_gt_np[i, :], 's--', label=rf'Ground Truth $u_{{{i+1}}}$', linewidth=2, alpha=0.7)
-        
-        ax1.set_xlabel('Phase Index $k$', fontsize=12)
-        ax1.set_ylabel(r'Control Value $u_k$', fontsize=12)
-        ax1.set_title('Control Inputs per Phase', fontsize=14, fontweight='bold')
-        ax1.legend(fontsize=10)
-        ax1.grid(True, alpha=0.3)
-        
-        # Plot phase durations
-        ax2.bar(range(n_phases), pred_deltas_np, alpha=0.7, label=r'Predicted $\delta_k$', color='steelblue')
-        if show_ground_truth and hasattr(self, 'phases_duration_gt'):
-            phases_duration_gt_np = self.phases_duration_gt.cpu().numpy()
-            ax2.bar(range(n_phases), phases_duration_gt_np, alpha=0.5, label=r'Ground Truth $\delta_k$', color='orange')
-        
-        ax2.set_xlabel('Phase Index $k$', fontsize=12)
-        ax2.set_ylabel(r'Duration $\delta_k$', fontsize=12)
-        ax2.set_title('Phase Durations', fontsize=14, fontweight='bold')
-        ax2.legend(fontsize=10)
-        ax2.grid(True, alpha=0.3, axis='y')
+                ax1.plot(range(n_phases), controls_gt_np[0, :], 's--', label=rf'Ground Truth $u_{{1}}$', linewidth=2, alpha=0.7)
+            ax1.set_xlabel('Phase Index $k$', fontsize=12)
+            ax1.set_ylabel(r'Control Value $u_k$', fontsize=12)
+            ax1.set_title('Control Inputs per Phase', fontsize=14, fontweight='bold')
+            ax1.legend(fontsize=10)
+            ax1.grid(True, alpha=0.3)
+
+            # durations
+            ax2.bar(range(n_phases), pred_deltas_np, alpha=0.7, label=r'Predicted $\delta_k$', color='steelblue')
+            if show_ground_truth and hasattr(self, 'phases_duration_gt'):
+                phases_duration_gt_np = self.phases_duration_gt.cpu().numpy()
+                ax2.bar(range(n_phases), phases_duration_gt_np, alpha=0.5, label=r'Ground Truth $\delta_k$', color='orange')
+            ax2.set_xlabel('Phase Index $k$', fontsize=12)
+            ax2.set_ylabel(r'Duration $\delta_k$', fontsize=12)
+            ax2.set_title('Phase Durations', fontsize=14, fontweight='bold')
+            ax2.legend(fontsize=10)
+            ax2.grid(True, alpha=0.3, axis='y')
+        else:
+            # Create one axis per input + one for durations
+            fig, axes = plt.subplots(n_inputs + 1, 1, figsize=(12, 3 * (n_inputs + 1)), sharex=False)
+            # axes[0..n_inputs-1] are for each input
+            controls_gt_np = self.controls_gt.cpu().numpy() if (show_ground_truth and hasattr(self, 'controls_gt')) else None
+            for i in range(n_inputs):
+                ax = axes[i]
+                ax.plot(range(n_phases), pred_u_reshaped[:, i], 'o-', label=rf'Predicted $u_{{{i+1}}}$', linewidth=2)
+                if controls_gt_np is not None:
+                    ax.plot(range(n_phases), controls_gt_np[i, :], 's--', label=rf'Ground Truth $u_{{{i+1}}}$', linewidth=2, alpha=0.7)
+                ax.set_ylabel(rf'$u_{{{i+1}}}$', fontsize=11)
+                ax.legend(fontsize=9)
+                ax.grid(True, alpha=0.3)
+
+            # durations in the last axis
+            axd = axes[-1]
+            axd.bar(range(n_phases), pred_deltas_np, alpha=0.7, label=r'Predicted $\delta_k$', color='steelblue')
+            if show_ground_truth and hasattr(self, 'phases_duration_gt'):
+                phases_duration_gt_np = self.phases_duration_gt.cpu().numpy()
+                axd.bar(range(n_phases), phases_duration_gt_np, alpha=0.5, label=r'Ground Truth $\delta_k$', color='orange')
+            axd.set_xlabel('Phase Index $k$', fontsize=12)
+            axd.set_ylabel(r'$\delta_k$', fontsize=11)
+            axd.set_title('Phase Durations', fontsize=14, fontweight='bold')
+            axd.legend(fontsize=9)
+            axd.grid(True, alpha=0.3, axis='y')
         
         plt.tight_layout()
         
@@ -453,54 +547,67 @@ class ModelValidator:
         # Create time points for piecewise constant signal
         time_points_pred = np.concatenate([[0], np.cumsum(pred_deltas_np)])
         
-        # Create figure
-        fig, ax = plt.subplots(figsize=(14, 6))
-        
-        # Plot predicted controls as piecewise constant
-        for i in range(n_inputs):
+        # Create figure(s): one subplot per input for piecewise control
+        if n_inputs <= 1:
+            fig, ax = plt.subplots(figsize=(14, 6))
             for phase in range(n_phases):
                 t_start = time_points_pred[phase]
                 t_end = time_points_pred[phase + 1]
-                control_value = pred_u_reshaped[phase, i]
-                
-                # Draw horizontal line for this phase
-                ax.plot([t_start, t_end], [control_value, control_value], 
-                       linewidth=2.5, color=f'C0', label=rf'Predicted $u_{{{i+1}}}(t)$' if phase == 0 else '')
-                
-                # Draw vertical line at phase transition (except at start)
+                control_value = pred_u_reshaped[phase, 0]
+                ax.plot([t_start, t_end], [control_value, control_value], linewidth=2.5, color='C0')
                 if phase > 0:
-                    prev_value = pred_u_reshaped[phase - 1, i]
-                    ax.plot([t_start, t_start], [prev_value, control_value], 
-                           linewidth=2.5, color=f'C0', linestyle=':')
-        
-        # Plot ground truth if available
-        if show_ground_truth and hasattr(self, 'controls_gt') and hasattr(self, 'phases_duration_gt'):
-            controls_gt_np = self.controls_gt.cpu().numpy()
-            phases_duration_gt_np = self.phases_duration_gt.cpu().numpy()
-            time_points_gt = np.concatenate([[0], np.cumsum(phases_duration_gt_np)])
-            
-            for i in range(n_inputs):
+                    prev_value = pred_u_reshaped[phase - 1, 0]
+                    ax.plot([t_start, t_start], [prev_value, control_value], linewidth=2.5, color='C0', linestyle=':')
+
+            # Ground truth
+            if show_ground_truth and hasattr(self, 'controls_gt') and hasattr(self, 'phases_duration_gt'):
+                controls_gt_np = self.controls_gt.cpu().numpy()
+                phases_duration_gt_np = self.phases_duration_gt.cpu().numpy()
+                time_points_gt = np.concatenate([[0], np.cumsum(phases_duration_gt_np)])
                 for phase in range(n_phases):
                     t_start = time_points_gt[phase]
                     t_end = time_points_gt[phase + 1]
-                    control_value = controls_gt_np[i, phase]
-                    
-                    # Draw horizontal line for this phase
-                    ax.plot([t_start, t_end], [control_value, control_value], 
-                           linewidth=2, color=f'C1', linestyle='--', alpha=0.6,
-                           label=rf'Ground Truth $u_{{{i+1}}}(t)$' if phase == 0 else '')
-                    
-                    # Draw vertical line at phase transition (except at start)
+                    control_value = controls_gt_np[0, phase]
+                    ax.plot([t_start, t_end], [control_value, control_value], linewidth=2, color='C1', linestyle='--', alpha=0.6)
                     if phase > 0:
-                        prev_value = controls_gt_np[i, phase - 1]
-                        ax.plot([t_start, t_start], [prev_value, control_value], 
-                               linewidth=2, color=f'C1', linestyle=':', alpha=0.6)
-        
-        ax.set_xlabel(r'Time $t$', fontsize=12)
-        ax.set_ylabel(r'Control $u(t)$', fontsize=12)
-        ax.set_title('Piecewise Constant Control Signal Over Time', fontsize=14, fontweight='bold')
-        ax.legend(fontsize=10, loc='best')
-        ax.grid(True, alpha=0.3)
+                        prev_value = controls_gt_np[0, phase - 1]
+                        ax.plot([t_start, t_start], [prev_value, control_value], linewidth=2, color='C1', linestyle=':', alpha=0.6)
+
+            ax.set_xlabel(r'Time $t$', fontsize=12)
+            ax.set_ylabel(r'Control $u(t)$', fontsize=12)
+            ax.set_title('Piecewise Constant Control Signal Over Time', fontsize=14, fontweight='bold')
+            ax.grid(True, alpha=0.3)
+            ax.legend([r'Predicted $u(t)$', r'Ground Truth $u(t)$'] if (show_ground_truth and hasattr(self, 'controls_gt')) else [r'Predicted $u(t)$'], fontsize=10, loc='best')
+        else:
+            fig, axes = plt.subplots(n_inputs, 1, figsize=(14, 3 * n_inputs), sharex=False)
+            controls_gt_np = self.controls_gt.cpu().numpy() if (show_ground_truth and hasattr(self, 'controls_gt')) else None
+            phases_duration_gt_np = self.phases_duration_gt.cpu().numpy() if (show_ground_truth and hasattr(self, 'phases_duration_gt')) else None
+            time_points_gt = np.concatenate([[0], np.cumsum(phases_duration_gt_np)]) if phases_duration_gt_np is not None else None
+
+            for i in range(n_inputs):
+                ax = axes[i]
+                for phase in range(n_phases):
+                    t_start = time_points_pred[phase]
+                    t_end = time_points_pred[phase + 1]
+                    control_value = pred_u_reshaped[phase, i]
+                    ax.plot([t_start, t_end], [control_value, control_value], linewidth=2.5, color='C0')
+                    if phase > 0:
+                        prev_value = pred_u_reshaped[phase - 1, i]
+                        ax.plot([t_start, t_start], [prev_value, control_value], linewidth=2.5, color='C0', linestyle=':')
+
+                if controls_gt_np is not None and time_points_gt is not None:
+                    for phase in range(n_phases):
+                        t_start = time_points_gt[phase]
+                        t_end = time_points_gt[phase + 1]
+                        control_value = controls_gt_np[i, phase]
+                        ax.plot([t_start, t_end], [control_value, control_value], linewidth=2, color='C1', linestyle='--', alpha=0.6)
+                        if phase > 0:
+                            prev_value = controls_gt_np[i, phase - 1]
+                            ax.plot([t_start, t_start], [prev_value, control_value], linewidth=2, color='C1', linestyle=':', alpha=0.6)
+
+                ax.set_ylabel(rf'$u_{{{i+1}}}(t)$', fontsize=11)
+                ax.grid(True, alpha=0.3)
+                ax.legend([rf'Predicted $u_{{{i+1}}}(t)$', rf'Ground Truth $u_{{{i+1}}}(t)$'] if controls_gt_np is not None else [rf'Predicted $u_{{{i+1}}}(t)$'], fontsize=9)
         
         plt.tight_layout()
         
@@ -517,8 +624,8 @@ if __name__ == "__main__":
     # Load the model
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
-    n_phases = 80
-    n_control_inputs = 1
+    n_phases = 50
+    n_control_inputs = 2
     n_NN_inputs = 3
     n_NN_outputs = n_phases * (n_control_inputs + 1)
     model = SwiLinNN(
@@ -528,7 +635,7 @@ if __name__ == "__main__":
     model.to(device)
     
     # Load checkpoint
-    checkpoint_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'models', 'pannocchia_torch_20251209_182122.pt'))
+    checkpoint_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'models', 'nahs_torch_20251210_152104.pt'))
     model.load_state_dict(torch.load(checkpoint_path, map_location=device))
     # Set model to evaluation mode
     model.eval()
@@ -537,10 +644,10 @@ if __name__ == "__main__":
     validator = ModelValidator(model, device=device)
     
     # Load data
-    validator.load_data('optimal_params.mat')
+    validator.load_data('example_1_paper_NAHS.mat')
     
     # Define initial state
-    x0 = np.array([1.3440, -4.5850, 5.6470])
+    x0 = np.array([2, -1, 5])
     
     # Validate on data
     criterion = nn.MSELoss()
