@@ -497,8 +497,6 @@ if TORCH_AVAILABLE:
         J_batch = 0.5 * quad + G0
         return J_batch
     
-    
-    
     def train_neural_network(
         network: SwiLinNN,
         X_train: torch.Tensor,
@@ -965,7 +963,7 @@ def example_torch():
     
     # Create network
     network = SwiLinNN(
-        layer_sizes=[n_NN_inputs, 512, 256, n_NN_outputs],
+        layer_sizes=[n_NN_inputs, 50, 50, n_NN_outputs],
         n_phases=n_phases,
         activation='relu',
         output_activation='linear'
@@ -991,7 +989,7 @@ def example_torch():
         optimizer='adam',
         learning_rate=0.001,
         weight_decay=1e-4,
-        n_epochs=200,
+        n_epochs=400,
         resample_every=None,
         resample_fn=None,
         resample_val=False,

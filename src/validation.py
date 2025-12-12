@@ -629,13 +629,13 @@ if __name__ == "__main__":
     n_NN_inputs = 3
     n_NN_outputs = n_phases * (n_control_inputs + 1)
     model = SwiLinNN(
-        layer_sizes=[n_NN_inputs, 512, 256, n_NN_outputs],
+        layer_sizes=[n_NN_inputs, 50, 50, n_NN_outputs],
         n_phases=n_phases,
     )
     model.to(device)
     
     # Load checkpoint
-    checkpoint_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'models', 'nahs_torch_20251210_152104.pt'))
+    checkpoint_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'models', 'nahs_torch_20251212_165742.pt'))
     model.load_state_dict(torch.load(checkpoint_path, map_location=device))
     # Set model to evaluation mode
     model.eval()
