@@ -14,6 +14,7 @@ import numpy as np
 import os, subprocess, sys
 import scipy.io
 from scipy.linalg import solve_continuous_are
+import time
 from typing import Optional, Callable, Tuple, Dict, List
 import warnings
 import json
@@ -27,7 +28,7 @@ except ImportError:
     TORCH_AVAILABLE = False
     warnings.warn("PyTorch not available. GPU training will not be available.")
     
-from .switched_linear_torch import SwiLin
+from src.switched_linear_torch import SwiLin
 
 
 # ============================================================================
@@ -78,30 +79,8 @@ if TORCH_AVAILABLE:
         def switched_problem(self, n_phases: int):
             """Define switched linear problem."""
             model = {
-                'A': [
-                    np.array([[-2.5, 0.5, 0.3], [0.4, -2.0, 0.6], [0.2, 0.3, -1.8]]),
-                    np.array([[-1.9, 3.2, 0.4], [0.3, -2.1, 0.5], [0, 0.6, -2.3]]),
-                    np.array([[-2.2, 0, 0.5],   [0.2, -1.7, 0.4], [0.3, 0.2, -2.0]]),
-                    np.array([[-1.8, 0.3, 0.2], [0.5, -2.4, 0],   [0.4, 0, -2.2]]),
-                    np.array([[-2.0, 0.4, 0],   [0.3, -2.2, 0.2], [0.5, 0.3, -1.9]]),
-                    np.array([[-2.3, 0.2, 0.3], [0, -2.0, 0.4],   [0.2, 0.5, -2.1]]),
-                    np.array([[-1.7, 0.5, 0.4], [0.2, -2.5, 0.3], [1.1, 0.2, -2.4]]),
-                    np.array([[-2.1, 0.3, 0.2], [0.4, -1.9, 0.5], [0.3, 0.1, -2.0]]),
-                    np.array([[-2.4, 0, 0.5],   [0.2, -2.3, 0.3], [0.4, 0.2, -1.8]]),
-                    np.array([[-1.8, 0.4, 0.3], [0.5, -2.1, 0.2], [0.2, 3.1, -2.2]]),
-                ],
-                'B': [
-                    np.array([[1.5, 0.3], [0.4, 1.2], [0.2, 0.8]]),
-                    np.array([[1.2, 0.5], [0.3, 0.9], [0.4, 1.1]]),
-                    np.array([[1.0, 0.4], [0.5, 1.3], [0.3, 0.7]]),
-                    np.array([[1.4, 0.2], [0.6, 1.0], [0.1, 0.9]]),
-                    np.array([[1.3, 0.1], [0.2, 1.4], [0.5, 0.6]]),
-                    np.array([[1.1, 0.3], [0.4, 1.5], [0.2, 0.8]]),
-                    np.array([[1.6, 0.2], [0.3, 1.1], [0.4, 0.7]]),
-                    np.array([[1.0, 0.4], [0.5, 1.2], [0.3, 0.9]]),
-                    np.array([[1.2, 0.5], [0.1, 1.3], [0.6, 0.8]]),
-                    np.array([[1.4, 0.3], [0.2, 1.0], [0.5, 0.7]]),
-                ],
+                'A': [np.array([[-0.1, 0, 0], [0, -2, -6.25], [0, 4, 0]])],
+                'B': [np.array([[0.25], [2], [0]])],
             }
 
 
@@ -123,9 +102,10 @@ if TORCH_AVAILABLE:
             # Load model
             swi_lin.load_model(model)
 
-            Q = 10. * np.eye(n_states)
-            R = 10. * np.eye(n_inputs)
-            E = 1. * np.eye(n_states)
+            Q = 1. * np.eye(n_states)
+            R = 0.1 * np.eye(n_inputs)
+            # Solve the Algebraic Riccati Equation
+            E = np.array(solve_continuous_are(model['A'][0], model['B'][0], Q, R))
 
             swi_lin.load_weights(Q, R, E)
             
@@ -183,17 +163,6 @@ if TORCH_AVAILABLE:
             # Ensure parent directory exists
             os.makedirs(os.path.dirname(path), exist_ok=True)
             torch.save(self.state_dict(), path)
-
-        def load(self, path: str, map_location: Optional[str] = None) -> None:
-            """Load the network parameters from `path` into this model.
-
-            Args:
-                path: filesystem path from which to load the state_dict.
-                map_location: optional torch.load map_location argument.
-            """
-            map_loc = map_location if map_location is not None else None
-            state = torch.load(path, map_location=map_loc)
-            self.load_state_dict(state)
     
     def evaluate_cost_functional(swi: SwiLin, u_all: torch.Tensor, delta_all: torch.Tensor, x0: torch.Tensor) -> torch.Tensor:
         """
@@ -952,8 +921,8 @@ def example_torch():
     torch.manual_seed(42)
     n_samples_train = 10000
     n_samples_val = 200
-    n_phases = 50
-    n_control_inputs = 2
+    n_phases = 80
+    n_control_inputs = 1
     n_NN_inputs = 3
     n_NN_outputs = n_phases * (n_control_inputs + 1)
     
@@ -978,7 +947,7 @@ def example_torch():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     date = subprocess.check_output(['date', '+%Y%m%d_%H%M%S']).decode('utf-8').strip()
     tensorboard_logdir = os.path.join(script_dir, "..", "logs", date)
-    model_name = f"nahs_torch_{date}.pt"
+    model_name = f"pannocchia_50_50_torch_{date}.pt"
     models_dir = os.path.join(script_dir, "..", "models", model_name)
     
     params_opt, history = train_neural_network(
@@ -1044,8 +1013,6 @@ def load_data(filename):
 
 
 if __name__ == "__main__":
-    import time
-    
     # print("\n" + "=" * 70 + "\n")
     # data_file = 'optimal_params.mat'
     # data = load_data(data_file)
