@@ -21,8 +21,8 @@ except ImportError:
     warnings.warn("PyTorch not available. GPU training will not be available.")
     
 from ocslc.switched_linear import SwiLin as SwiLin_casadi
-from switched_linear_torch import SwiLin
-from training import SwiLinNN
+from .switched_linear_torch import SwiLin
+from .training import SwiLinNN
 
 
 class ModelValidator:

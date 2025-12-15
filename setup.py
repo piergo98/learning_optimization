@@ -9,9 +9,11 @@ from setuptools import setup, find_packages
 if __name__ == "__main__":
     setup(
         name="learning-optimization",
-        packages=find_packages(include=["optimizers", "optimizers.*", "data", "data.*"]),
+        # Discover and install the actual package modules present in this repo.
+        # The project places its code under the `src/` package directory.
+        packages=find_packages(include=["src", "src.*", "data", "data.*"]),
         package_data={
-            "optimizers": ["*.md", "*.txt"],
+            "src": ["*.md", "*.txt"],
             "data": ["*.mat", "*.csv"],
         },
     )

@@ -1,48 +1,27 @@
-"""
-Optimizers module for gradient-based optimization.
+"""learning_optimization.src
 
-Includes NumPy-based optimizers (SGD, Adam, RMSProp) and PyTorch GPU-accelerated versions.
+Top-level package exports for the ``src`` package.
+
+This file exposes the main classes and utilities implemented under ``src/`` so
+they can be imported as ``from learning_optimization.src import SwiLin`` etc.
+
+Only existing modules are imported here — previous versions referenced
+optimizer modules that are not part of this repository layout and caused
+import-time errors. Keep this file minimal and resilient to optional
+dependencies (e.g. PyTorch).
 """
 
 __version__ = "0.1.0"
 
-from .sgd import (
-    StochasticGradientDescent,
-    sgd_optimize,
-    RMSPropOptimizer,
-    AdamOptimizer,
-    rmsprop_optimize,
-    adam_optimize,
-)
+from .switched_linear_torch import SwiLin
+from .training import SwiLinNN, train_neural_network
+from .validation import ModelValidator
+from .switched_system_simulator import SwitchedSystemSimulator
 
-# PyTorch optimizers (optional - only if torch is installed)
-try:
-    from .optimizers import (
-        SGD,
-        Adam,
-        RMSProp,
-        gpu_optimize,
-    )
-    _TORCH_AVAILABLE = True
-
-    # provide common aliases so the imported symbols are actually referenced
-    SGD = SGD
-    Adam = Adam
-    RMSProp = RMSProp
-    gpu_optimize = gpu_optimize
-
-    __all__ = [
-        '__version__',
-        'StochasticGradientDescent', 'sgd_optimize',
-        'RMSPropOptimizer', 'AdamOptimizer', 'rmsprop_optimize', 'adam_optimize',
-        'SGD', 'Adam', 'RMSProp', 'gpu_optimize',
-        '_TORCH_AVAILABLE',
-    ]
-except ImportError:
-    _TORCH_AVAILABLE = False
-    __all__ = [
-        '__version__',
-        'StochasticGradientDescent', 'sgd_optimize',
-        'RMSPropOptimizer', 'AdamOptimizer', 'rmsprop_optimize', 'adam_optimize',
-        '_TORCH_AVAILABLE',
-    ]
+__all__ = [
+    '__version__',
+    'SwiLin',
+    'SwiLinNN', 'train_neural_network',
+    'ModelValidator',
+    'SwitchedSystemSimulator',
+]

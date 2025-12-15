@@ -58,13 +58,14 @@ Repository = "https://github.com/piergo98/learning_optimization"
 Issues = "https://github.com/piergo98/learning_optimization/issues"
 
 [tool.setuptools.packages.find]
-# include the package and all its subpackages so modules like optimizers.c2t
-# and optimizers.cusadiops are installed and importable after installation
+# Include the actual Python package directory present in this repository.
+# The project uses a top-level `src` package (i.e. the `src/` directory
+# contains an importable package), so ensure it is discovered and installed.
 where = ["."]
-include = ["optimizers*", "data*"]
+include = ["src*", "data*"]
 
 [tool.setuptools.package-data]
-optimizers = ["*.md", "*.txt"]
+src = ["*.md", "*.txt"]
 data = ["*.mat", "*.csv"]
 
 [tool.black]
@@ -80,4 +81,4 @@ disallow_untyped_defs = false
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
-addopts = "-v --cov=optimizers --cov-report=term-missing"
+addopts = "-v --cov=src --cov-report=term-missing"

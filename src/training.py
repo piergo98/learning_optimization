@@ -27,7 +27,7 @@ except ImportError:
     TORCH_AVAILABLE = False
     warnings.warn("PyTorch not available. GPU training will not be available.")
     
-from switched_linear_torch import SwiLin
+from .switched_linear_torch import SwiLin
 
 
 # ============================================================================
@@ -104,10 +104,11 @@ if TORCH_AVAILABLE:
                 ],
             }
 
+
             n_states = model['A'][0].shape[0]
             n_inputs = model['B'][0].shape[1]
 
-            self.time_horizon = 2.0
+            self.time_horizon = 1.0
             
             xr = np.array([1, -3])
             
