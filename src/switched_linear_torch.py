@@ -545,7 +545,7 @@ class SwiLin:
         S_int_used = S_int.clone()
         
         # Compute S matrix
-        S = 0.5 * S_int_used + (phi.T @ S_prev_used @ phi)
+        S = S_int_used + (phi.T @ S_prev_used @ phi)
         
         return S
     
@@ -933,12 +933,12 @@ class SwiLin:
         # Augment E_term by adding a zero row and column
         E_ = torch.zeros((self.n_states + 1, self.n_states + 1), dtype=self.dtype, device=self.device)
         E_[:self.n_states, :self.n_states] = self.E_term
-        self.S[-1] = 0.5*E_
+        self.S[-1] = E_
         if xr is not None:
             if isinstance(xr, np.ndarray):
                 xr = torch.tensor(xr, dtype=self.dtype, device=self.device)
             xr_aug = torch.cat([xr, torch.ones(1, dtype=self.dtype, device=self.device)])
-            self.Sr.append(0.5*self.E_term @ xr_aug)
+            self.Sr.append(E_ @ xr_aug)
 
         for i in range(self.n_phases-1, -1, -1):
             u_i = u_all[i]
