@@ -87,7 +87,7 @@ if TORCH_AVAILABLE:
             n_states = model['A'][0].shape[0]
             n_inputs = model['B'][0].shape[1]
 
-            self.time_horizon = 1.0
+            self.time_horizon = 10.0
             
             xr = np.array([1, -3])
             
@@ -700,8 +700,14 @@ if TORCH_AVAILABLE:
                 controls = output[:, :n_control_outputs] # shape (batch_size, n_phases * n_inputs)
                 delta_raw = output[:, n_control_outputs:]
                 
+                # To build a diffeomorphism, we fix the value of one delta_raw to zero
+                # This keeps the positivity and sum-to-T properties validity
+                # make the first delta value identically zero while preserving gradients
+                last = delta_raw[:, -1:]  # shape (batch_size, 1)
+                delta_raw_traslated = delta_raw - last  # subtract broadcasted last column -> last becomes 0 (differentiable)
+                
                 # Apply softmax and scale deltas
-                delta_normalized = F.softmax(delta_raw, dim=-1)
+                delta_normalized = F.softmax(delta_raw_traslated, dim=-1)
                 deltas = delta_normalized * T_tensor # shape (batch_size, n_phases)
                 
                 # Clip controls using tanh-based soft clipping to preserve gradients
@@ -771,7 +777,9 @@ if TORCH_AVAILABLE:
                     # Soft clipping: maps (-inf, inf) to (u_min, u_max) smoothly
                     val_controls = u_center + u_range * torch.tanh(val_controls)
                     val_delta_raw = val_output[:, n_control_outputs:]
-                    val_delta_normalized = F.softmax(val_delta_raw, dim=-1)
+                    val_delta_raw_last = val_delta_raw[:, -1:]
+                    val_delta_raw_traslated = val_delta_raw - val_delta_raw_last
+                    val_delta_normalized = F.softmax(val_delta_raw_traslated, dim=-1)
                     val_deltas = val_delta_normalized * T_tensor
                     val_transformed = torch.cat([val_controls, val_deltas], dim=-1)
                     

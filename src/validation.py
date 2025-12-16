@@ -21,8 +21,8 @@ except ImportError:
     warnings.warn("PyTorch not available. GPU training will not be available.")
     
 from ocslc.switched_linear import SwiLin as SwiLin_casadi
-from .switched_linear_torch import SwiLin
-from .training import SwiLinNN
+from src.switched_linear_torch import SwiLin
+from src.training import SwiLinNN
 
 
 class ModelValidator:
@@ -101,9 +101,11 @@ class ModelValidator:
             n_control_outputs = self.model.n_phases * n_inputs
             pred_u = prediction[:, :n_control_outputs] # shape (batch_size, n_phases * n_inputs)
             pred_delta_raw = prediction[:, n_control_outputs:]
+            last = pred_delta_raw[:, -1:]  # shape (batch_size, 1)
+            pred_delta_raw_traslated = pred_delta_raw - last  # subtract broadcasted last column -> last becomes 0 (differentiable) 
             
             # Apply softmax and scale deltas
-            delta_normalized = F.softmax(pred_delta_raw, dim=-1)
+            delta_normalized = F.softmax(pred_delta_raw_traslated, dim=-1)
             pred_deltas = delta_normalized * T_tensor # shape (batch_size, n_phases)
             
             # Clip controls using tanh-based soft clipping to preserve gradients
@@ -126,36 +128,14 @@ class ModelValidator:
         """
         # First compute the cost function value using the Casadi SwiLin system
         # Create a simple switched linear system
-        n_phases = 50
+        n_phases = 80
         n_states = 3
-        n_inputs = 2
-        time_horizon = 2.0
+        n_inputs = 1
+        time_horizon = 10.0
 
         model = {
-            'A': [
-                np.array([[-2.5, 0.5, 0.3], [0.4, -2.0, 0.6], [0.2, 0.3, -1.8]]),
-                np.array([[-1.9, 3.2, 0.4], [0.3, -2.1, 0.5], [0, 0.6, -2.3]]),
-                np.array([[-2.2, 0, 0.5],   [0.2, -1.7, 0.4], [0.3, 0.2, -2.0]]),
-                np.array([[-1.8, 0.3, 0.2], [0.5, -2.4, 0],   [0.4, 0, -2.2]]),
-                np.array([[-2.0, 0.4, 0],   [0.3, -2.2, 0.2], [0.5, 0.3, -1.9]]),
-                np.array([[-2.3, 0.2, 0.3], [0, -2.0, 0.4],   [0.2, 0.5, -2.1]]),
-                np.array([[-1.7, 0.5, 0.4], [0.2, -2.5, 0.3], [1.1, 0.2, -2.4]]),
-                np.array([[-2.1, 0.3, 0.2], [0.4, -1.9, 0.5], [0.3, 0.1, -2.0]]),
-                np.array([[-2.4, 0, 0.5],   [0.2, -2.3, 0.3], [0.4, 0.2, -1.8]]),
-                np.array([[-1.8, 0.4, 0.3], [0.5, -2.1, 0.2], [0.2, 3.1, -2.2]]),
-            ],
-            'B': [
-                np.array([[1.5, 0.3], [0.4, 1.2], [0.2, 0.8]]),
-                np.array([[1.2, 0.5], [0.3, 0.9], [0.4, 1.1]]),
-                np.array([[1.0, 0.4], [0.5, 1.3], [0.3, 0.7]]),
-                np.array([[1.4, 0.2], [0.6, 1.0], [0.1, 0.9]]),
-                np.array([[1.3, 0.1], [0.2, 1.4], [0.5, 0.6]]),
-                np.array([[1.1, 0.3], [0.4, 1.5], [0.2, 0.8]]),
-                np.array([[1.6, 0.2], [0.3, 1.1], [0.4, 0.7]]),
-                np.array([[1.0, 0.4], [0.5, 1.2], [0.3, 0.9]]),
-                np.array([[1.2, 0.5], [0.1, 1.3], [0.6, 0.8]]),
-                np.array([[1.4, 0.3], [0.2, 1.0], [0.5, 0.7]]),
-            ],
+            'A': [np.array([[-0.1, 0, 0], [0, -2, -6.25], [0, 4, 0]])],
+            'B': [np.array([[0.25], [2], [0]])],
         }
 
         # print("Creating SwiLin system...")
@@ -167,9 +147,10 @@ class ModelValidator:
 
         # print("Precomputing matrices...")
         # Convert x0 to numpy for CasADi
-        Q = 10. * np.eye(n_states)
-        R = 10. * np.eye(n_inputs)
-        E = 1. * np.eye(n_states)
+        Q = 1. * np.eye(n_states)
+        R = 0.1 * np.eye(n_inputs)
+        # Solve the Algebraic Riccati Equation
+        E = np.array(solve_continuous_are(model['A'][0], model['B'][0], Q, R))
 
         swi_lin.load_weights(Q, R, E)
         swi_lin_casadi.precompute_matrices(x0, Q, R, E)
@@ -220,9 +201,11 @@ class ModelValidator:
             n_control_outputs = self.model.n_phases * n_inputs
             pred_u = prediction[:, :n_control_outputs] # shape (batch_size, n_phases * n_inputs)
             pred_delta_raw = prediction[:, n_control_outputs:]
+            last = pred_delta_raw[:, -1:]  # shape (batch_size, 1)
+            pred_delta_raw_traslated = pred_delta_raw - last  # subtract broadcasted last column -> last becomes 0 (differentiable)
             
             # Apply softmax and scale deltas
-            delta_normalized = F.softmax(pred_delta_raw, dim=-1)
+            delta_normalized = F.softmax(pred_delta_raw_traslated, dim=-1)
             pred_deltas = delta_normalized * T_tensor # shape (batch_size, n_phases)
             
             # Clip controls using tanh-based soft clipping to preserve gradients
@@ -624,8 +607,8 @@ if __name__ == "__main__":
     # Load the model
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
-    n_phases = 50
-    n_control_inputs = 2
+    n_phases = 80
+    n_control_inputs = 1
     n_NN_inputs = 3
     n_NN_outputs = n_phases * (n_control_inputs + 1)
     model = SwiLinNN(
@@ -635,7 +618,7 @@ if __name__ == "__main__":
     model.to(device)
     
     # Load checkpoint
-    checkpoint_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'models', 'nahs_torch_20251212_165742.pt'))
+    checkpoint_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'models', 'pannocchia_50_50_torch_20251216_145750.pt'))
     model.load_state_dict(torch.load(checkpoint_path, map_location=device))
     # Set model to evaluation mode
     model.eval()
@@ -644,10 +627,12 @@ if __name__ == "__main__":
     validator = ModelValidator(model, device=device)
     
     # Load data
-    validator.load_data('example_1_paper_NAHS.mat')
+    validator.load_data('optimal_params.mat')
     
     # Define initial state
-    x0 = np.array([2, -1, 5])
+    x0 = np.array([1.3440, -4.5850, 5.6470])
+    # x0 = np.array([2, -1, 5])
+    
     
     # Validate on data
     criterion = nn.MSELoss()
@@ -672,9 +657,9 @@ if __name__ == "__main__":
     # Plot the network output
     print("\nGenerating plot...")
     plot_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'images', 'network_output.png'))
-    validator.plot_network_output(x0, save_path=None, show_ground_truth=True)
+    validator.plot_network_output(x0, save_path=plot_path, show_ground_truth=True)
     
     # Plot piecewise constant control
     print("\nGenerating piecewise constant control plot...")
     piecewise_plot_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'images', 'piecewise_control.png'))
-    validator.plot_piecewise_constant_control(x0, save_path=None, show_ground_truth=True)
+    validator.plot_piecewise_constant_control(x0, save_path=piecewise_plot_path, show_ground_truth=True)

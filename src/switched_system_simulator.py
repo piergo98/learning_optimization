@@ -809,9 +809,11 @@ class SwitchedSystemSimulator:
         n_control_outputs = n_phases * self.n_inputs
         pred_u = output[:n_control_outputs] # shape (n_phases * n_inputs,)
         pred_delta_raw = output[n_control_outputs:]
+        last = pred_delta_raw[-1]
+        pred_delta_raw_traslated = pred_delta_raw - last  # shape (n_phases,)
         
         # Apply softmax and scale deltas
-        delta_normalized = softmax(pred_delta_raw, axis=-1)
+        delta_normalized = softmax(pred_delta_raw_traslated, axis=-1)
         deltas = delta_normalized * T # shape (n_phases,)
         
         # Clip controls using tanh-based soft clipping to preserve gradients
