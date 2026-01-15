@@ -23,12 +23,34 @@ try:
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
+    from torch.nn.utils import parametrize
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
     warnings.warn("PyTorch not available. GPU training will not be available.")
     
 from src.switched_linear_torch import SwiLin
+
+
+# ============================================================================
+# Weight Constraints
+# ============================================================================
+
+class NonNegative(nn.Module):
+    """
+    Parametrization to enforce non-negative weights.
+    
+    This can be registered on any parameter to ensure it stays non-negative
+    during training. Uses exponential mapping to enforce positivity while
+    maintaining differentiability.
+    """
+    def forward(self, X):
+        """Apply non-negative constraint using exponential."""
+        return torch.abs(X)  # Alternative: torch.exp(X) or F.relu(X)
+    
+    def right_inverse(self, X):
+        """Initialize from non-negative values."""
+        return X  # For abs(), identity works. For exp(), use torch.log(X)
 
 
 # ============================================================================
@@ -48,10 +70,16 @@ if TORCH_AVAILABLE:
         ----------
         layer_sizes : list of int
             Number of units in each layer.
+        n_phases : int, optional
+            Number of phases in the switched linear system. Default is 80.
         activation : str
             Activation function: 'relu', 'tanh', 'sigmoid'.
         output_activation : str
             Output layer activation: 'softmax', 'sigmoid', 'linear'.
+        nonnegative_weights : list of int, optional
+            Indices of layers whose weights should be constrained to be non-negative.
+            For example, [0, 2] will constrain the first and third layers.
+            If None, no constraints are applied.
         """
         
         def __init__(
@@ -59,9 +87,10 @@ if TORCH_AVAILABLE:
             layer_sizes: List[int],
             n_phases: int = 80,
             activation: str = 'relu',
-            output_activation: str = 'linear'
+            output_activation: str = 'linear',
+            nonnegative_weights: Optional[List[int]] = None
         ):
-            super().__init__()
+            super(SwiLinNN, self).__init__()
             
             # Build switched linear problem
             self.n_phases = n_phases
@@ -75,19 +104,32 @@ if TORCH_AVAILABLE:
             self.layers = nn.ModuleList()
             for i in range(len(layer_sizes) - 1):
                 self.layers.append(nn.Linear(layer_sizes[i], layer_sizes[i + 1]))
+            
+            # Apply non-negative weight constraints to specified layers
+            if nonnegative_weights is not None:
+                for layer_idx in nonnegative_weights:
+                    if layer_idx < 0 or layer_idx >= len(self.layers):
+                        raise ValueError(f"Invalid layer index {layer_idx}. Must be in [0, {len(self.layers)-1}]")
+                    parametrize.register_parametrization(
+                        self.layers[layer_idx],
+                        "weight",
+                        NonNegative()
+                    )
                 
         def switched_problem(self, n_phases: int):
             """Define switched linear problem."""
             model = {
-                'A': [np.array([[-0.1, 0, 0], [0, -2, -6.25], [0, 4, 0]])],
-                'B': [np.array([[0.25], [2], [0]])],
+                # 'A': [np.array([[-0.1, 0, 0], [0, -2, -6.25], [0, 4, 0]])],
+                # 'B': [np.array([[0.25], [2], [0]])],
+                'A': [np.array([[1]]), np.array([[-3]])],
+                'B': [np.array([[2]]), np.array([[-1]])],
             }
 
 
             n_states = model['A'][0].shape[0]
             n_inputs = model['B'][0].shape[1]
 
-            self.time_horizon = 10.0
+            self.time_horizon = 1.0
             
             xr = np.array([1, -3])
             
@@ -431,17 +473,17 @@ if TORCH_AVAILABLE:
 
         S0_batch = S_prev
 
-        # Forward propagate states for each sample
-        x_curr = x0_batch.view(B, n_x, 1)
-        for i in range(n_ph):
-            Ei_b = Es[i]
-            phi_f_b = phi_fs[i]
-            if n_u > 0:
-                # Ei_b: (B,n_x,n_x), x_curr: (B,n_x,1) -> (B,n_x,1)
-                x_next = torch.matmul(Ei_b, x_curr) + phi_f_b
-            else:
-                x_next = torch.matmul(Ei_b, x_curr)
-            x_curr = x_next
+        # # Forward propagate states for each sample
+        # x_curr = x0_batch.view(B, n_x, 1)
+        # for i in range(n_ph):
+        #     Ei_b = Es[i]
+        #     phi_f_b = phi_fs[i]
+        #     if n_u > 0:
+        #         # Ei_b: (B,n_x,n_x), x_curr: (B,n_x,1) -> (B,n_x,1)
+        #         x_next = torch.matmul(Ei_b, x_curr) + phi_f_b
+        #     else:
+        #         x_next = torch.matmul(Ei_b, x_curr)
+        #     x_curr = x_next
 
         # Augment x0 for bilinear form
         x0_aug = torch.cat([x0_batch.view(B, n_x, 1), torch.ones((B, 1, 1), device=device, dtype=dtype)], dim=1)
@@ -927,17 +969,17 @@ def example_torch():
     
     # Generate synthetic data
     torch.manual_seed(42)
-    n_samples_train = 10000
-    n_samples_val = 200
-    n_phases = 80
+    n_samples_train = 1000
+    n_samples_val = 10
+    n_phases = 10
     n_control_inputs = 1
     n_NN_inputs = 3
     n_NN_outputs = n_phases * (n_control_inputs + 1)
     
-    X_train = torch.empty(n_samples_train, n_NN_inputs).uniform_(-10.0, 10.0)
+    X_train = torch.empty(n_samples_train, n_NN_inputs).uniform_(-1.0, 1.0)
     
     
-    X_val = torch.empty(n_samples_val, n_NN_inputs).uniform_(-10.0, 10.0)
+    X_val = torch.empty(n_samples_val, n_NN_inputs).uniform_(-1.0, 1.0)
     
     # Create network
     network = SwiLinNN(
