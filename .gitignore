@@ -44,3 +44,9 @@ htmlcov/
 *.mat
 *.pkl
 *.h5
+
+# models, plots, and results in experiments
+experiments/*/models/
+**/plots/
+**/results/
+experiments/example_plots/
