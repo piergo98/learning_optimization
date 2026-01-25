@@ -159,17 +159,22 @@ if TORCH_AVAILABLE:
         
         def forward(self, x):
             """Forward pass."""
+            acts = []
             for i, layer in enumerate(self.layers):
                 x = layer(x)
+                acts.append(x)
                 
                 if i < len(self.layers) - 1:
                     # Hidden layers
                     if self.activation == 'relu':
                         x = F.relu(x)
+                        acts.append(x)
                     elif self.activation == 'tanh':
                         x = torch.tanh(x)
+                        acts.append(x)
                     elif self.activation == 'sigmoid':
                         x = torch.sigmoid(x)
+                        acts.append(x)
                 else:
                     # Output layer
                     if self.output_activation == 'softmax':
@@ -179,7 +184,7 @@ if TORCH_AVAILABLE:
                     elif self.output_activation == 'linear':
                         pass  # No activation
             
-            return x
+            return x, acts
         
         def get_flat_params(self):
             """Get flattened network parameters."""
@@ -509,6 +514,334 @@ if TORCH_AVAILABLE:
         J_batch = 0.5 * quad + G0
         return J_batch
     
+    def evaluate_gradient_batch(
+        swi: SwiLin,
+        u_all_batch: torch.Tensor,
+        delta_all_batch: torch.Tensor,
+        x0_batch: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Vectorized evaluation of the gradient of the LQR-style cost over a batch.
+
+        Args:
+            swi: SwiLin instance (used for model matrices and helpers)
+            u_all_batch: tensor shape (B, N_PHASES, n_inputs)
+            delta_all_batch: tensor shape (B, N_PHASES)
+            x0_batch: tensor shape (B, n_states)
+        Returns:
+            grad_u_batch: tensor shape (B, N_PHASES, n_inputs)
+            grad_delta_batch: tensor shape (B, N_PHASES)
+        """
+        device = u_all_batch.device if torch.is_tensor(u_all_batch) else swi.device
+        dtype = u_all_batch.dtype if torch.is_tensor(u_all_batch) else swi.dtype
+
+        B = u_all_batch.shape[0]
+        n_ph = swi.n_phases
+        n_x = swi.n_states
+        n_u = swi.n_inputs
+
+        # Ensure tensors on correct device/dtype
+        u_all_batch = u_all_batch.to(device=device, dtype=dtype)
+        delta_all_batch = delta_all_batch.to(device=device, dtype=dtype).view(B, n_ph)
+        x0_batch = x0_batch.to(device=device, dtype=dtype).view(B, n_x)
+        
+        time_steps = 256  # Number of steps for numerical integration
+        num_steps = 256   # Number of steps for inner numerical integration
+        
+        # Ensure time_steps is a tensor constant for graph compatibility
+        time_steps_t = torch.tensor(time_steps, dtype=dtype, device=device)
+        num_steps_t = torch.tensor(num_steps, dtype=dtype, device=device)
+
+        # Containers per phase (each element will be batch-shaped)
+        # Pre-allocate tensors to maintain computational graph
+        Es = []
+        phi_fs = []
+        Lis = []
+        Mis = []
+        Ris = []
+        Hi = []
+        
+        # Container for S, C, D, and N matrices
+        S = []
+        C = []
+        D = []
+        N = []
+
+        # Useful constants - extend Q to (n_x+1, n_x+1) for augmented state
+        Q_base = swi.Q.to(dtype=dtype, device=device)
+        R = swi.R.to(dtype=dtype, device=device) if n_u > 0 else None
+        Eterm = swi.E_term.to(dtype=dtype, device=device)
+        
+        # Create augmented Q matrix (n_x+1, n_x+1) with Q in top-left corner
+        Q = torch.zeros((n_x+1, n_x+1), dtype=dtype, device=device)
+        Q[:n_x, :n_x] = Q_base
+
+        # For each phase compute batched matrices
+        for i in range(n_ph):
+            A = swi.A[i].to(dtype=dtype, device=device)
+            Bmat = swi.B[i].to(dtype=dtype, device=device) if n_u > 0 else None
+
+            # Build big C matrix once (same across batch) as in _mat_exp_prop_exp
+            if not swi.auto:
+                m = n_u
+                Mdim = 3 * n_x + m
+                C_base = torch.zeros((Mdim, Mdim), dtype=dtype, device=device)
+                C_base[:n_x, :n_x] = -A.T
+                C_base[:n_x, n_x:2*n_x] = torch.eye(n_x, dtype=dtype, device=device)
+                C_base[n_x:2*n_x, n_x:2*n_x] = -A.T
+                C_base[n_x:2*n_x, 2*n_x:3*n_x] = Q_base
+                C_base[2*n_x:3*n_x, 2*n_x:3*n_x] = A
+                C_base[2*n_x:3*n_x, 3*n_x:] = Bmat
+                
+                # Create batch of C scaled by delta
+                deltas_i = delta_all_batch[:, i].view(B, 1, 1)
+                C_batch = C_base.unsqueeze(0) * deltas_i
+
+                # Batched matrix exponential
+                exp_C = torch.linalg.matrix_exp(C_batch)
+
+                # Extract pieces
+                F3 = exp_C[:, 2*n_x:3*n_x, 2*n_x:3*n_x]  # (B, n_x, n_x)
+                G2 = exp_C[:, n_x:2*n_x, 2*n_x:3*n_x]  # (B, n_x, n_x)
+                G3 = exp_C[:, 2*n_x:3*n_x, 3*n_x:]      # (B, n_x, m)
+                H2 = exp_C[:, n_x:2*n_x, 3*n_x:]       # (B, n_x, m)
+                K1 = exp_C[:, :n_x, 3*n_x:]            # (B, n_x, m)
+
+                Ei_batch = F3
+                Li_batch = torch.matmul(F3.transpose(-1, -2), G2)
+
+                # phi_f_i = phi_f_i_ @ ui for each sample
+                ui_batch = u_all_batch[:, i, :].view(B, n_u, 1) if n_u > 0 else None
+                if n_u > 0:
+                    phi_f_i_ = G3  # (B, n_x, m)
+                    # phi_f: (B, n_x, 1)
+                    phi_f_batch = torch.matmul(phi_f_i_, ui_batch)
+
+                    # Mi = F3.T @ H2 -> (B, n_x, m)
+                    Mi_batch = torch.matmul(F3.transpose(-1, -2), H2)
+
+                    # Ri: temp = B.T @ F3.T @ K1  -> (B, m, m)
+                    # compute F3.T @ K1 -> (B, n_x, m)
+                    tmp = torch.matmul(F3.transpose(-1, -2), K1)
+                    # Bmat.T (m,n_x) @ tmp (B, n_x, m) -> (B, m, m)
+                    temp = torch.matmul(Bmat.T.unsqueeze(0), tmp)
+                    Ri_batch = temp + temp.transpose(-1, -2)
+                    
+                    # Create batched H matrix for this mode: shape (B, n_u, n_x+1, n_x+1)
+                    Hi_batch = torch.zeros((B, n_u, n_x+1, n_x+1), dtype=dtype, device=device)
+                    for k in range(n_u):
+                        # phi_f_i_ has shape (B, n_x, n_u); put its k-th column into the top-right column
+                        Hi_batch[:, k, :n_x, n_x] = phi_f_i_[:, :, k]
+                    
+                    # Compute the D matrix for this phase
+                    D_i = torch.zeros((B, n_u, n_x+1, n_x+1), dtype=dtype, device=device)
+                    
+                    # Get the delta for this specific phase
+                    deltas_i = delta_all_batch[:, i]  # (B,)
+                    
+                    # eta grid for integrating over [0, delta] - batched version
+                    # Shape: (time_steps + 1, B)
+                    eta_vals = torch.linspace(0, 1, steps=time_steps + 1, device=device, dtype=dtype)
+                    eta_grid = eta_vals.unsqueeze(1) * deltas_i.unsqueeze(0)  # (time_steps+1, B)
+                    d_eta = deltas_i / time_steps
+                    
+                    for ti in range(time_steps + 1):
+                        eta = eta_grid[ti]  # (B,)
+                        # phi_a_t = expm(A, eta)  - batched version
+                        # A * eta needs broadcasting: A (n,n), eta (B,) -> (B,n,n)
+                        A_scaled = A.unsqueeze(0) * eta.view(B, 1, 1)
+                        phi_a = torch.linalg.matrix_exp(A_scaled)  # (B,n,n)
+
+                        # phi_f_t = compute_integral(A, B, 0, eta) - batched
+                        # s values for each batch element
+                        s_vals = torch.linspace(0, 1, steps=num_steps + 1, device=A.device, dtype=A.dtype)
+                        s_grid = s_vals.unsqueeze(1) * eta.unsqueeze(0)  # (num_steps+1, B)
+                        ds = eta / num_steps  # (B,)
+
+                        # exp(A*(eta - s_j)) B for each s_j - fully batched
+                        # eta (B,), s_grid (num_steps+1, B) -> eta - s (num_steps+1, B)
+                        eta_minus_s = eta.unsqueeze(0) - s_grid  # (num_steps+1, B)
+                        # Need (num_steps+1, B, n, n) matrix exponentials
+                        A_diff = A.unsqueeze(0).unsqueeze(0) * eta_minus_s.view(num_steps+1, B, 1, 1)
+                        E_all = torch.linalg.matrix_exp(A_diff)  # (num_steps+1, B, n, n)
+                        # E @ Bmat for all: (num_steps+1, B, n, n) @ (n, m) -> (num_steps+1, B, n, m)
+                        vals = torch.matmul(E_all, Bmat.unsqueeze(0).unsqueeze(0))  # (num_steps+1, B, n, m)
+
+                        # trapezoid along time dimension (dim=0)
+                        trapz_weights = torch.ones(num_steps + 1, device=device, dtype=dtype)
+                        trapz_weights[0] = 0.5
+                        trapz_weights[-1] = 0.5
+                        # Weighted sum: (num_steps+1, B, n, m) * (num_steps+1, 1, 1, 1)
+                        weighted_vals = vals * trapz_weights.view(-1, 1, 1, 1)
+                        phi_f_int = ds.view(1, B, 1, 1) * weighted_vals.sum(dim=0)  # (B, n, m)
+
+                        # phi_t = transition_matrix(phi_a_t, phi_f_t@ui) - batched
+                        # phi_f_int (B,n,m), ui (B,m,1) -> phi_fu (B,n,1)
+                        phi_fu = torch.matmul(phi_f_int, ui_batch)  # (B, n, 1)
+                        # Construct Phi (B, n_x+1, n_x+1)
+                        Phi = torch.zeros((B, n_x + 1, n_x + 1), device=device, dtype=dtype)
+                        Phi[:, :n_x, :n_x] = phi_a
+                        Phi[:, :n_x, n_x] = phi_fu.squeeze(-1)
+                        Phi[:, n_x, n_x] = 1.0
+
+                        # trapezoid weight
+                        w = 0.5 if (ti == 0 or ti == time_steps) else 1.0
+
+                        # For each control channel k, form Hij and integrand - vectorized
+                        # phi_f_int has shape (B, n_x, m)
+                        for k in range(n_u):
+                            # Hij (B, n_x+1, n_x+1) with last column from kth column of phi_f_int
+                            Hij = torch.zeros((B, n_x + 1, n_x + 1), device=device, dtype=dtype)
+                            Hij[:, :n_x, n_x] = phi_f_int[:, :, k]  # (B, n_x)
+
+                            # arg = Hij^T @ Q @ Phi + Phi^T @ Q @ Hij - batched matmul
+                            # Q is (n_x+1, n_x+1), broadcast to batch
+                            Q_ext = Q.unsqueeze(0)  # (1, n_x+1, n_x+1)
+                            term1 = torch.matmul(torch.matmul(Hij.transpose(-2, -1), Q_ext), Phi)  # (B, n_x+1, n_x+1)
+                            term2 = torch.matmul(torch.matmul(Phi.transpose(-2, -1), Q_ext), Hij)  # (B, n_x+1, n_x+1)
+                            arg = term1 + term2
+
+                            integrand = 0.5 * arg  # (B, n_x+1, n_x+1)
+                            D_i[:, k] = D_i[:, k] + w * integrand
+
+                    # Finish trapezoid integration over eta - batched
+                    D_i = d_eta.view(B, 1, 1, 1) * D_i  # (B, n_u, n_x+1, n_x+1)
+                    
+                else:
+                    phi_f_batch = torch.zeros((B, n_x, 1), device=device, dtype=dtype)
+                    Mi_batch = torch.zeros((B, n_x, 0), device=device, dtype=dtype)
+                    Ri_batch = torch.zeros((B, 0, 0), device=device, dtype=dtype)
+                    Hi_batch = torch.zeros((B, 0, n_x+1, n_x+1), dtype=dtype, device=device)
+                    D_i = torch.zeros((B, 0, n_x+1, n_x+1), dtype=dtype, device=device)
+
+                Es.append(Ei_batch)
+                phi_fs.append(phi_f_batch)
+                Lis.append(Li_batch)
+                Mis.append(Mi_batch)
+                Ris.append(Ri_batch)
+                Hi.append(Hi_batch)
+                D.append(D_i)
+            else:
+                # Autonomous case: simpler (Ei depends only on delta)
+                deltas_i = delta_all_batch[:, i].view(B, 1, 1)
+                Ei_batch = torch.linalg.matrix_exp(A.unsqueeze(0) * deltas_i)
+                Li_batch = torch.zeros((B, n_x, n_x), device=device, dtype=dtype)
+                Es.append(Ei_batch)
+                phi_fs.append(torch.zeros((B, n_x, 1), device=device, dtype=dtype))
+                Lis.append(Li_batch)
+                Mis.append(torch.zeros((B, n_x, 0), device=device, dtype=dtype))
+                Ris.append(torch.zeros((B, 0, 0), device=device, dtype=dtype))
+                Hi.append(torch.zeros((B, 0, n_x+1, n_x+1), dtype=dtype, device=device))
+                D.append(torch.zeros((B, 0, n_x+1, n_x+1), dtype=dtype, device=device))
+                
+        # Backward recursion to compute S0 per sample
+        # Initialize S_prev as (B, n_x+1, n_x+1)
+        E_aug = torch.zeros((n_x+1, n_x+1), device=device, dtype=dtype)
+        E_aug[:n_x, :n_x] = Eterm
+        S_terminal = 0.5 * E_aug.unsqueeze(0).expand(B, n_x+1, n_x+1).clone()
+        
+        # Pre-allocate S list with terminal condition at the end
+        S_list = [None] * (n_ph + 1)
+        S_list[n_ph] = S_terminal
+        S_prev = S_terminal
+
+        for i in range(n_ph-1, -1, -1):
+            Ei_b = Es[i]
+            phi_f_b = phi_fs[i]
+            Li_b = Lis[i]
+            Mi_b = Mis[i]
+            Ri_b = Ris[i]
+
+            # Build S_int batch
+            S_int = torch.zeros((B, n_x+1, n_x+1), device=device, dtype=dtype)
+            S_int[:, :n_x, :n_x] = Li_b
+
+            if n_u > 0:
+                ui_col = u_all_batch[:, i, :].view(B, n_u, 1)
+                # Mi_b: (B, n_x, n_u) -> Mi_ui: (B, n_x, 1)
+                Mi_ui = torch.matmul(Mi_b, ui_col)
+                S_int[:, :n_x, n_x:] = Mi_ui
+                S_int[:, n_x:, :n_x] = Mi_ui.transpose(-1, -2)
+                # scalar term: ui^T Ri ui -> (B,1,1)
+                tmp = torch.matmul(Ri_b, ui_col)  # (B, n_u, 1)
+                uiRiui = torch.matmul(ui_col.transpose(-1, -2), tmp)  # (B,1,1)
+                S_int[:, n_x:, n_x:] = uiRiui
+
+            # Build phi batch (B, n_x+1, n_x+1)
+            phi = torch.zeros((B, n_x+1, n_x+1), device=device, dtype=dtype)
+            phi[:, :n_x, :n_x] = Ei_b
+            phi[:, :n_x, n_x:n_x+1] = phi_f_b
+            phi[:, -1, -1] = 1.0
+
+            # S_curr = 0.5*S_int + phi^T * S_prev * phi
+            S_curr = 0.5 * S_int + torch.matmul(phi.transpose(-1, -2), torch.matmul(S_prev, phi))
+            S_list[i] = S_curr
+            S_prev = S_curr
+            
+        S0_batch = S_prev
+
+        # Compute the C and N matrices
+        C_list = []
+        N_list = []
+        
+        for i in range(n_ph):
+            A = swi.A[i].to(dtype=dtype, device=device)
+            Bmat = swi.B[i].to(dtype=dtype, device=device) if n_u > 0 else None
+            # Build batched F to preserve autograd (shape: B x (n_x+1) x (n_x+1))
+            F = torch.zeros((B, n_x+1, n_x+1), dtype=dtype, device=device)
+            # Top-left block: A (broadcasted across batch)
+            F[:, :n_x, :n_x] = A.unsqueeze(0).expand(B, n_x, n_x)
+            # Top-right column: B @ u (batched)
+            if n_u > 0:
+                ui_col = u_all_batch[:, i, :].view(B, n_u, 1)
+                F[:, :n_x, n_x:n_x+1] = torch.matmul(Bmat.unsqueeze(0), ui_col)
+            
+            # Extract the S matrix of the next phase
+            S_next = S_list[i+1]
+            H_i = Hi[i]
+            
+            # C_i: batched computation
+            Q_batch = Q.unsqueeze(0)  # (1, n_x+1, n_x+1)
+            C_i = 0.5 * Q_batch + torch.matmul(F.transpose(-2, -1), S_next) + torch.matmul(S_next, F)
+            C_list.append(C_i)
+            
+            # N matrices for each control input
+            N_i_list = []
+            for j in range(n_u):
+                Hij = H_i[:, j, :, :]  # (B, n_x+1, n_x+1)
+                # Compute N matrix
+                Nij = torch.matmul(Hij.transpose(-2, -1), S_next) + torch.matmul(S_next, Hij)
+                N_i_list.append(Nij)
+            
+            if n_u > 0:
+                N_list.append(torch.stack(N_i_list, dim=1))  # (B, n_u, n_x+1, n_x+1)
+            else:
+                N_list.append(torch.zeros((B, 0, n_x+1, n_x+1), dtype=dtype, device=device))
+        
+        # Compute gradients from C and N matrices
+        grad_u_batch = torch.zeros((B, n_ph, n_u), dtype=dtype, device=device)
+        grad_delta_batch = torch.zeros((B, n_ph), dtype=dtype, device=device)
+        
+        for i in range(n_ph):
+            C_i = C_list[i]  # (B, n_x+1, n_x+1)
+            N_i = N_list[i]  # (B, n_u, n_x+1, n_x+1)
+            D_i = D[i]  # (B, n_u, n_x+1, n_x+1)
+            
+            # Build augmented state for this phase
+            # We need to track state through phases - simplified version
+            # grad_u is derived from C matrix structure
+            if n_u > 0:
+                # Extract gradients w.r.t. controls from C matrix
+                # C has contribution from control inputs in the (n_x, n_x+1) positions
+                grad_u_batch[:, i, :] = C_i[:, :n_x, n_x].sum(dim=1, keepdim=True).expand(-1, n_u)
+                
+                # grad_delta from N and D matrices
+                # Simplified: trace of N and D contributions
+                for j in range(n_u):
+                    grad_delta_batch[:, i] += (N_i[:, j] * D_i[:, j]).sum(dim=(-2, -1))
+        
+        return grad_u_batch, grad_delta_batch
+    
     def train_neural_network(
         network: SwiLinNN,
         X_train: torch.Tensor,
@@ -732,7 +1065,7 @@ if TORCH_AVAILABLE:
                 torch_optimizer.zero_grad()
                 
                 # Forward pass
-                output = network(X_batch)
+                output, _ = network(X_batch)
                 
                 # Apply transformation: T * softmax(output[-n_phases:]) for the deltas
                 T_tensor = torch.tensor(network.sys.time_horizon, device=output.device, dtype=output.dtype)
@@ -806,7 +1139,7 @@ if TORCH_AVAILABLE:
             # Validation loss
             if X_val is not None:
                 with torch.no_grad():
-                    val_output = network(X_val)
+                    val_output, _ = network(X_val)
                     
                     # Transform validation output
                     n_control_outputs = network.n_phases * n_inputs
